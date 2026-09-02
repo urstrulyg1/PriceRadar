@@ -1,175 +1,304 @@
-import { useEffect, useMemo, useState, type CSSProperties, type FormEvent, type ReactNode } from 'react'
 import {
-  AlertCircle,
-  ArrowDownRight,
-  ArrowLeft,
-  ArrowRight,
-  ArrowUpRight,
-  Bell,
-  BellRing,
-  Check,
-  ChevronDown,
-  ChevronRight,
-  CircleHelp,
-  Clock3,
-  Copy,
-  ExternalLink,
-  Eye,
-  Filter,
-  Gift,
-  Globe2,
-  Heart,
-  History,
-  Info,
-  LayoutDashboard,
-  ListFilter,
-  MapPin,
-  Menu,
-  Minus,
-  Moon,
-  MoreHorizontal,
-  PackageCheck,
-  PanelLeftClose,
-  Plus,
-  RefreshCw,
-  Radar,
-  Search,
-  Settings2,
-  Share2,
-  ShieldCheck,
-  ShoppingBag,
-  Sparkles,
-  Star,
-  Sun,
-  Tag,
-  TrendingDown,
-  Truck,
-  Users,
-  WalletCards,
-  X,
-  Zap,
+  useCallback, useEffect, useMemo, useRef, useState,
+  type CSSProperties, type FormEvent, type KeyboardEvent, type ReactNode,
+} from 'react'
+import {
+  AlertCircle, ArrowDownRight, ArrowLeft, ArrowRight, ArrowUpRight,
+  Bell, BellRing, Check, ChevronDown, ChevronRight, ChevronUp,
+  CircleHelp, Clock3, Copy, ExternalLink, Eye, Filter, Gift,
+  Globe2, Heart, History, Info, LayoutDashboard, ListFilter,
+  MapPin, Menu, Minus, Moon, MoreHorizontal, PackageCheck,
+  PanelLeftClose, Plus, RefreshCw, Radar, Search, Settings2,
+  Share2, ShieldCheck, ShoppingBag, Sparkles, Star, Sun, Tag,
+  TrendingDown, TrendingUp, Truck, Users, WalletCards, X, Zap,
 } from 'lucide-react'
-import { catalog, defaultProduct, findProduct, providers } from './data/catalog'
-import { discountPercent, feeTotal, finalPrice, formatRupees, sortOffers, summarize } from './domain/compare'
-import type { DeliveryMode, MatchLevel, Offer, Product } from './domain/types'
+import {
+  Area, AreaChart, CartesianGrid, ReferenceLine,
+  ResponsiveContainer, Tooltip, XAxis, YAxis,
+} from 'recharts'
+import {
+  catalog, defaultProduct, findProduct, generateAiResponse,
+  parseQuery, providers,
+} from './data/catalog'
+import {
+  buildFeeRows, discountPercent, finalPrice, formatRupees,
+  matchLevelToConfidence, priceInsight, sortOffers, summarize,
+} from './domain/compare'
+import type {
+  AiMessage, DeliveryMode, MatchLevel, Offer, PriceAlert,
+  Product, SearchHistoryEntry, WishlistItem,
+} from './domain/types'
 
- type Mode = DeliveryMode | 'all'
+// ─── Local types ──────────────────────────────────────────────────────────────
+type Mode = DeliveryMode | 'all'
 type ViewId = 'compare' | 'overview' | 'alerts' | 'wishlist' | 'history'
-type SortKey = 'overall' | 'price' | 'speed'
+type SortKey = 'overall' | 'price' | 'speed' | 'discount' | 'rating'
+type FilterState = {
+  priceMin: string; priceMax: string;
+  providers: string[];
+  availability: boolean; exactOnly: boolean;
+}
 
-const navItems: Array<{ id: ViewId; label: string; icon: typeof Radar; badge?: string }> = [
-  { id: 'compare', label: 'Compare prices', icon: Radar },
-  { id: 'overview', label: 'Overview', icon: LayoutDashboard },
-  { id: 'alerts', label: 'Price alerts', icon: BellRing, badge: '3' },
-  { id: 'wishlist', label: 'Wishlist', icon: Heart, badge: '4' },
-  { id: 'history', label: 'Search history', icon: History },
+// ─── Constants ────────────────────────────────────────────────────────────────
+const NAV_ITEMS: Array<{ id: ViewId; label: string; icon: typeof Radar }> = [
+  { id: 'compare',  label: 'Compare prices',  icon: Radar },
+  { id: 'overview', label: 'Overview',         icon: LayoutDashboard },
+  { id: 'alerts',   label: 'Price alerts',     icon: BellRing },
+  { id: 'wishlist', label: 'Wishlist',         icon: Heart },
+  { id: 'history',  label: 'Search history',  icon: History },
 ]
 
-const searchSuggestions = [
-  { label: 'iPhone 16 128GB black', icon: 'phone' },
-  { label: 'AirPods Pro 2', icon: 'audio' },
-  { label: 'cheapest shampoo near me', icon: 'spark' },
+const SORT_OPTIONS: Array<{ value: SortKey; label: string }> = [
+  { value: 'overall',  label: 'Best overall' },
+  { value: 'price',    label: 'Lowest price' },
+  { value: 'speed',    label: 'Fastest delivery' },
+  { value: 'discount', label: 'Biggest discount' },
+  { value: 'rating',   label: 'Highest rated' },
 ]
 
-const locations = ['Koramangala, Bengaluru', 'Indiranagar, Bengaluru', 'HSR Layout, Bengaluru']
+const LOCATIONS = [
+  'Koramangala, Bengaluru',
+  'Indiranagar, Bengaluru',
+  'HSR Layout, Bengaluru',
+  'Whitefield, Bengaluru',
+  'Bandra, Mumbai',
+]
 
-function App() {
+const SEARCH_SUGGESTIONS = [
+  { label: 'iPhone 16 128GB black', hint: 'Mobiles' },
+  { label: 'AirPods Pro 2',          hint: 'Audio' },
+  { label: 'cheapest shampoo near me', hint: 'Personal care' },
+  { label: 'basmati rice 5kg',        hint: 'Groceries' },
+  { label: 'detergent under ₹300',   hint: 'Household' },
+]
+
+const AI_QUICK_PROMPTS = [
+  'Find the cheapest iPhone 16 near me',
+  'Detergent under ₹300 delivered in 30 min',
+  'Is this a good price right now?',
+  'Best shampoo under ₹500',
+]
+
+const INITIAL_ALERTS: PriceAlert[] = [
+  { id: 'a1', productId: 'amul-taaza-1l',         productName: 'Amul Taaza Milk 1L',                targetPrice: 55,    currentBest: 67,    status: 'active',    createdAt: '2025-08-28' },
+  { id: 'a2', productId: 'iphone-16-128-black',   productName: 'iPhone 16 128GB Black',              targetPrice: 68000, currentBest: 69499, status: 'active',    createdAt: '2025-08-25' },
+  { id: 'a3', productId: 'airpods-pro-2-usbc',    productName: 'AirPods Pro 2 USB-C',               targetPrice: 17500, currentBest: 18499, status: 'active',    createdAt: '2025-08-20' },
+]
+
+const INITIAL_WISHLIST: WishlistItem[] = catalog.map((p) => ({ productId: p.id, addedAt: '2025-08-15' }))
+
+const INITIAL_HISTORY: SearchHistoryEntry[] = [
+  { query: 'Amul Taaza Milk 1L',        productId: 'amul-taaza-1l',          timestamp: '2025-09-02T10:42:00', offerCount: 6, bestTotal: 67 },
+  { query: 'iPhone 16 128GB black',     productId: 'iphone-16-128-black',    timestamp: '2025-09-01T20:16:00', offerCount: 5, bestTotal: 69499 },
+  { query: 'AirPods Pro 2',             productId: 'airpods-pro-2-usbc',     timestamp: '2025-08-28T16:02:00', offerCount: 3, bestTotal: 18499 },
+  { query: 'Head & Shoulders shampoo',  productId: 'head-shoulders-650',     timestamp: '2025-08-24T11:28:00', offerCount: 5, bestTotal: 400 },
+  { query: 'basmati rice 5kg',          productId: 'india-gate-basmati-5kg', timestamp: '2025-08-22T09:10:00', offerCount: 4, bestTotal: 453 },
+]
+
+// ─── Utility ──────────────────────────────────────────────────────────────────
+const uid = () => Math.random().toString(36).slice(2)
+
+function fmtRelTime(ts: string): string {
+  const diff = Date.now() - new Date(ts).getTime()
+  const m = Math.floor(diff / 60000)
+  if (m < 60) return `${m}m ago`
+  const h = Math.floor(m / 60)
+  if (h < 24) return `${h}h ago`
+  return `${Math.floor(h / 24)}d ago`
+}
+
+function fmtDate(iso: string): string {
+  return new Date(iso).toLocaleDateString('en-IN', { day: 'numeric', month: 'short' })
+}
+
+// ─── App ──────────────────────────────────────────────────────────────────────
+
+export default function App() {
+  // Views
   const [activeView, setActiveView] = useState<ViewId>('compare')
+
+  // Search
   const [query, setQuery] = useState('Amul Taaza Milk 1L')
   const [product, setProduct] = useState<Product>(defaultProduct)
-  const [mode, setMode] = useState<Mode>('instant')
-  const [providerFilter, setProviderFilter] = useState('all')
-  const [sort, setSort] = useState<SortKey>('overall')
-  const [exactOnly, setExactOnly] = useState(true)
-  const [location, setLocation] = useState(locations[0])
-  const [locationOpen, setLocationOpen] = useState(false)
   const [searchOpen, setSearchOpen] = useState(false)
+  const searchRef = useRef<HTMLInputElement>(null)
+
+  // Mode & filters
+  const [mode, setMode] = useState<Mode>('instant')
+  const [sort, setSort] = useState<SortKey>('overall')
+  const [filters, setFilters] = useState<FilterState>({
+    priceMin: '', priceMax: '', providers: [], availability: false, exactOnly: true,
+  })
+  const [showFilters, setShowFilters] = useState(false)
+
+  // UI state
+  const [location, setLocation] = useState(LOCATIONS[0])
+  const [locationOpen, setLocationOpen] = useState(false)
   const [sidebarOpen, setSidebarOpen] = useState(false)
   const [darkMode, setDarkMode] = useState(false)
   const [isRefreshing, setIsRefreshing] = useState(false)
-  const [saved, setSaved] = useState(false)
   const [selectedOffer, setSelectedOffer] = useState<Offer | null>(null)
   const [alertOpen, setAlertOpen] = useState(false)
-  const [alertSet, setAlertSet] = useState(false)
-  const [alertPrice, setAlertPrice] = useState('55')
+  const [alertPrice, setAlertPrice] = useState('')
+
+  // Toast
+  const [toast, setToast] = useState<{ msg: string; type?: 'success' | 'info' | 'error' } | null>(null)
+
+  // AI
   const [aiOpen, setAiOpen] = useState(false)
+  const [aiMessages, setAiMessages] = useState<AiMessage[]>([])
   const [aiDraft, setAiDraft] = useState('')
-  const [toast, setToast] = useState<string | null>(null)
+  const [aiLoading, setAiLoading] = useState(false)
+  const aiEndRef = useRef<HTMLDivElement>(null)
+
+  // Alerts & wishlist
+  const [alerts, setAlerts] = useState<PriceAlert[]>(INITIAL_ALERTS)
+  const [wishlist, setWishlist] = useState<WishlistItem[]>(INITIAL_WISHLIST)
+  const [history, setHistory] = useState<SearchHistoryEntry[]>(INITIAL_HISTORY)
+  const [providerFilter, setProviderFilter] = useState('all')
+
+  // ── Derived state ───────────────────────────────────────────────────────────
+
+  const isSaved = wishlist.some((w) => w.productId === product.id)
 
   const modeOffers = useMemo(() => {
-    let offers = product.offers.filter((offer) => mode === 'all' || offer.mode === mode)
-    if (providerFilter !== 'all') offers = offers.filter((offer) => offer.provider.id === providerFilter)
+    let offers = product.offers.filter((o) => mode === 'all' || o.mode === mode)
+    if (providerFilter !== 'all') offers = offers.filter((o) => o.provider.id === providerFilter)
     return offers
   }, [mode, product, providerFilter])
 
-  const exactModeOffers = useMemo(() => {
-    let offers = product.offers.filter((offer) => mode === 'all' || offer.mode === mode)
-    if (exactOnly) offers = offers.filter((offer) => offer.match === 'exact')
-    return offers
-  }, [mode, product, exactOnly])
-
-  const visibleOffers = useMemo(() => {
+  const filteredOffers = useMemo(() => {
     let offers = modeOffers
-    if (exactOnly) offers = offers.filter((offer) => offer.match === 'exact')
+    if (filters.exactOnly) offers = offers.filter((o) => o.match === 'exact' || o.match === 'likely')
+    if (filters.availability) offers = offers.filter((o) => o.availability === 'in_stock')
+    if (filters.priceMin) offers = offers.filter((o) => (finalPrice(o) ?? 0) >= Number(filters.priceMin))
+    if (filters.priceMax) offers = offers.filter((o) => (finalPrice(o) ?? Infinity) <= Number(filters.priceMax))
+    if (filters.providers.length) offers = offers.filter((o) => filters.providers.includes(o.provider.id))
     return sortOffers(offers, sort)
-  }, [modeOffers, exactOnly, sort])
+  }, [modeOffers, filters, sort])
 
-  const comparisonSummary = useMemo(() => summarize(exactModeOffers), [exactModeOffers])
-  const instantCount = product.offers.filter((offer) => offer.mode === 'instant').length
-  const normalCount = product.offers.filter((offer) => offer.mode === 'normal').length
-  const connectedProviderCount = providers.filter((item) => item.isConnected).length
-  const availableProviders = providers.filter((item) => product.offers.some((offer) => offer.provider.id === item.id && (mode === 'all' || offer.mode === mode)))
+  const summary = useMemo(() => summarize(filteredOffers), [filteredOffers])
+
+  const instantCount = product.offers.filter((o) => o.mode === 'instant').length
+  const normalCount  = product.offers.filter((o) => o.mode === 'normal').length
+  const connectedCount = providers.filter((p) => p.isConnected).length
+
+  // ── Effects ─────────────────────────────────────────────────────────────────
 
   useEffect(() => {
     if (!toast) return
-    const timeout = window.setTimeout(() => setToast(null), 3200)
-    return () => window.clearTimeout(timeout)
+    const t = setTimeout(() => setToast(null), 3400)
+    return () => clearTimeout(t)
   }, [toast])
 
-  const runSearch = (nextQuery: string) => {
-    const nextProduct = findProduct(nextQuery)
-    setQuery(nextQuery)
+  useEffect(() => {
+    document.documentElement.classList.toggle('dark', darkMode)
+  }, [darkMode])
+
+  useEffect(() => {
+    aiEndRef.current?.scrollIntoView({ behavior: 'smooth' })
+  }, [aiMessages, aiLoading])
+
+  // ── Actions ─────────────────────────────────────────────────────────────────
+
+  const showToast = (msg: string, type: 'success' | 'info' | 'error' = 'info') => setToast({ msg, type })
+
+  const runSearch = useCallback((q: string) => {
+    const nextProduct = findProduct(q)
+    setQuery(q)
     setProduct(nextProduct)
     setActiveView('compare')
     setProviderFilter('all')
     setSearchOpen(false)
-    // A product that exists only in the normal-delivery catalog opens there first.
-    setMode(nextProduct.offers.some((offer) => offer.mode === 'instant') ? 'instant' : 'normal')
-    setToast(`Comparing ${nextProduct.name}`)
-  }
+    setMode(nextProduct.offers.some((o) => o.mode === 'instant') ? 'instant' : 'normal')
+    // Add to history
+    const fp = Math.min(...nextProduct.offers.map((o) => finalPrice(o) ?? Infinity))
+    setHistory((prev) => [
+      { query: q, productId: nextProduct.id, timestamp: new Date().toISOString(), offerCount: nextProduct.offers.length, bestTotal: isFinite(fp) ? fp : undefined },
+      ...prev.filter((h) => h.query !== q),
+    ].slice(0, 20))
+    showToast(`Comparing ${nextProduct.name}`, 'success')
+  }, [])
 
-  const handleSearch = (event: FormEvent<HTMLFormElement>) => {
-    event.preventDefault()
+  const handleSearch = (e: FormEvent<HTMLFormElement>) => {
+    e.preventDefault()
     if (query.trim()) runSearch(query.trim())
   }
 
-  const chooseLocation = (nextLocation: string) => {
-    setLocation(nextLocation)
+  const chooseLocation = (loc: string) => {
+    setLocation(loc)
     setLocationOpen(false)
-    setToast(`Showing availability around ${nextLocation.split(',')[0]}`)
+    showToast(`Showing availability around ${loc.split(',')[0]}`, 'info')
   }
 
   const refreshOffers = () => {
     setIsRefreshing(true)
-    window.setTimeout(() => {
+    setTimeout(() => {
       setIsRefreshing(false)
-      setToast('All connected sources checked just now')
-    }, 900)
+      showToast('All connected sources refreshed', 'success')
+    }, 1100)
   }
 
   const shareComparison = async () => {
-    const shareText = `${product.name} price comparison on PriceRadar`
     try {
-      await navigator.clipboard?.writeText(window.location.href)
-      setToast('Comparison link copied to clipboard')
+      await navigator.clipboard.writeText(window.location.href)
+      showToast('Comparison link copied', 'success')
     } catch {
-      setToast(`${shareText} is ready to share`)
+      showToast('Share link ready', 'info')
     }
   }
 
-  const saveProduct = () => {
-    setSaved((current) => !current)
-    setToast(saved ? 'Removed from wishlist' : 'Saved to wishlist')
+  const toggleWishlist = () => {
+    if (isSaved) {
+      setWishlist((w) => w.filter((i) => i.productId !== product.id))
+      showToast('Removed from wishlist', 'info')
+    } else {
+      setWishlist((w) => [...w, { productId: product.id, addedAt: new Date().toISOString() }])
+      showToast('Saved to wishlist', 'success')
+    }
+  }
+
+  const saveAlert = (price: number) => {
+    const existing = alerts.findIndex((a) => a.productId === product.id)
+    const best = Math.min(...product.offers.map((o) => finalPrice(o) ?? Infinity))
+    const newAlert: PriceAlert = {
+      id: uid(), productId: product.id, productName: product.name,
+      targetPrice: price, currentBest: isFinite(best) ? best : 0,
+      status: 'active', createdAt: new Date().toISOString(),
+    }
+    if (existing >= 0) {
+      setAlerts((a) => a.map((item, i) => i === existing ? newAlert : item))
+    } else {
+      setAlerts((a) => [newAlert, ...a])
+    }
+    setAlertOpen(false)
+    showToast(`Alert set — we'll notify you when ${product.name} drops below ₹${price.toLocaleString('en-IN')}`, 'success')
+  }
+
+  const submitAiPrompt = async (e: FormEvent<HTMLFormElement>) => {
+    e.preventDefault()
+    if (!aiDraft.trim() || aiLoading) return
+    const userMsg: AiMessage = { id: uid(), role: 'user', content: aiDraft.trim(), timestamp: Date.now() }
+    setAiMessages((m) => [...m, userMsg])
+    setAiDraft('')
+    setAiLoading(true)
+    // Simulate network latency while building grounded response
+    await new Promise((r) => setTimeout(r, 750 + Math.random() * 500))
+    const { response, product: linkedProduct } = generateAiResponse(userMsg.content, product)
+    const assistantMsg: AiMessage = {
+      id: uid(), role: 'assistant', content: response,
+      timestamp: Date.now(), linkedProduct,
+    }
+    setAiMessages((m) => [...m, assistantMsg])
+    setAiLoading(false)
+    // If AI found a different product, navigate to it
+    if (linkedProduct.id !== product.id) {
+      runSearch(linkedProduct.searchTerms[0])
+    }
+  }
+
+  const useAiPrompt = (prompt: string) => {
+    setAiDraft(prompt)
   }
 
   const changeView = (view: ViewId) => {
@@ -177,43 +306,52 @@ function App() {
     setSidebarOpen(false)
   }
 
-  const submitAiPrompt = (event: FormEvent<HTMLFormElement>) => {
-    event.preventDefault()
-    if (!aiDraft.trim()) return
-    runSearch(aiDraft.trim())
-    setAiOpen(false)
-    setAiDraft('')
+  const openAlertFor = (p: Product) => {
+    const best = Math.min(...p.offers.map((o) => finalPrice(o) ?? Infinity))
+    setAlertPrice(isFinite(best) ? String(Math.round(best * 0.9)) : '')
+    setAlertOpen(true)
   }
+
+  // ── Render ──────────────────────────────────────────────────────────────────
 
   return (
     <div className={`app-shell${darkMode ? ' dark-mode' : ''}`}>
-      <aside className={`sidebar${sidebarOpen ? ' sidebar-open' : ''}`}>
+      {/* ── Sidebar ── */}
+      <aside className={`sidebar${sidebarOpen ? ' sidebar-open' : ''}`} aria-label="Main navigation">
         <div className="brand-row">
           <div className="brand-lockup">
-            <span className="brand-mark"><Radar size={21} strokeWidth={2.6} /></span>
+            <span className="brand-mark"><Radar size={20} strokeWidth={2.6} /></span>
             <span className="brand-name">Price<span>Radar</span></span>
           </div>
-          <button className="icon-button sidebar-close" aria-label="Close navigation" onClick={() => setSidebarOpen(false)}><PanelLeftClose size={18} /></button>
+          <button className="icon-button sidebar-close" aria-label="Close navigation" onClick={() => setSidebarOpen(false)}>
+            <PanelLeftClose size={18} />
+          </button>
         </div>
 
-        <div className="sidebar-location">
-          <div className="sidebar-location-icon"><MapPin size={14} /></div>
-          <div>
+        <button className="sidebar-location" onClick={() => setLocationOpen(true)} aria-label="Change location">
+          <span className="sidebar-location-icon"><MapPin size={14} /></span>
+          <span className="sidebar-location-text">
             <span>Shopping around</span>
             <strong>{location.split(',')[0]}</strong>
-          </div>
+          </span>
           <ChevronRight size={15} />
-        </div>
+        </button>
 
-        <nav className="side-navigation" aria-label="Main navigation">
+        <nav aria-label="Workspace navigation">
           <p className="side-label">Workspace</p>
-          {navItems.map((item) => {
-            const Icon = item.icon
+          {NAV_ITEMS.map(({ id, label, icon: Icon }) => {
+            const badge = id === 'alerts' ? alerts.filter((a) => a.status === 'active').length
+              : id === 'wishlist' ? wishlist.length : 0
             return (
-              <button key={item.id} className={`nav-item${activeView === item.id ? ' active' : ''}`} onClick={() => changeView(item.id)}>
-                <Icon size={18} strokeWidth={activeView === item.id ? 2.4 : 2} />
-                <span>{item.label}</span>
-                {item.badge && <span className="nav-badge">{item.badge}</span>}
+              <button
+                key={id}
+                className={`nav-item${activeView === id ? ' active' : ''}`}
+                onClick={() => changeView(id)}
+                aria-current={activeView === id ? 'page' : undefined}
+              >
+                <Icon size={18} strokeWidth={activeView === id ? 2.4 : 2} />
+                <span>{label}</span>
+                {badge > 0 && <span className="nav-badge" aria-label={`${badge} items`}>{badge}</span>}
               </button>
             )
           })}
@@ -221,285 +359,1610 @@ function App() {
 
         <div className="sidebar-spacer" />
 
+        {/* Provider health */}
         <div className="source-health">
-          <div className="health-topline"><span className="pulse-dot" /> <span>Source health</span><MoreHorizontal size={16} /></div>
+          <div className="health-topline">
+            <span className="pulse-dot" aria-hidden="true" />
+            <span>Source health</span>
+            <MoreHorizontal size={15} />
+          </div>
           <strong>All systems normal</strong>
-          <p><span>{connectedProviderCount}</span> providers refreshed in the last 5 min</p>
-          <div className="health-bars" aria-hidden="true"><i /><i /><i /><i /><i /><i /><i /><i /><i /><i /></div>
-          <button onClick={() => setToast('Provider management is coming soon')}>Manage sources <ArrowUpRight size={13} /></button>
+          <p><span>{connectedCount}</span> providers active</p>
+          <div className="health-bars" aria-hidden="true">
+            {[7, 13, 10, 8, 17, 9, 12, 8, 11, 7].map((h, i) => (
+              <i key={i} style={{ height: `${h}px`, background: i === 4 ? 'var(--lime)' : '#58a980' }} />
+            ))}
+          </div>
+          <button onClick={() => showToast('Provider management is coming in the next release', 'info')}>
+            Manage sources <ArrowUpRight size={13} />
+          </button>
         </div>
 
         <div className="sidebar-user">
-          <div className="user-avatar">AK</div>
-          <div className="user-copy"><strong>Arjun Kapoor</strong><span>Personal account</span></div>
+          <div className="user-avatar" aria-hidden="true">AK</div>
+          <div className="user-copy">
+            <strong>Arjun Kapoor</strong>
+            <span>Personal account</span>
+          </div>
           <Settings2 size={16} />
         </div>
       </aside>
-      {sidebarOpen && <button className="sidebar-scrim" aria-label="Close navigation" onClick={() => setSidebarOpen(false)} />}
 
+      {sidebarOpen && (
+        <button className="sidebar-scrim" aria-label="Close navigation" onClick={() => setSidebarOpen(false)} />
+      )}
+
+      {/* ── Main ── */}
       <main className="main-content">
+
+        {/* ── Topbar ── */}
         <header className="topbar">
-          <button className="icon-button mobile-menu" aria-label="Open navigation" onClick={() => setSidebarOpen(true)}><Menu size={21} /></button>
+          <button className="icon-button mobile-menu" aria-label="Open navigation" onClick={() => setSidebarOpen(true)}>
+            <Menu size={21} />
+          </button>
+
           <div className="topbar-location-wrap">
-            <button className="topbar-location" onClick={() => setLocationOpen((current) => !current)}>
+            <button className="topbar-location" onClick={() => setLocationOpen((v) => !v)} aria-expanded={locationOpen}>
               <span className="location-pin"><MapPin size={15} fill="currentColor" /></span>
-              <span><small>Deliver to</small><strong>{location}</strong></span>
+              <span>
+                <small>Deliver to</small>
+                <strong>{location}</strong>
+              </span>
               <ChevronDown size={15} />
             </button>
+
             {locationOpen && (
-              <div className="location-menu">
-                <div className="location-menu-header"><span>Choose your area</span><button onClick={() => setLocationOpen(false)}><X size={15} /></button></div>
-                {locations.map((item) => <button key={item} className={item === location ? 'selected' : ''} onClick={() => chooseLocation(item)}><MapPin size={15} /><span>{item}</span>{item === location && <Check size={15} />}</button>)}
-                <button className="add-location" onClick={() => setToast('Address search will be available soon')}><Plus size={15} /> Add a new address</button>
+              <div className="location-menu" role="dialog" aria-label="Choose location">
+                <div className="location-menu-header">
+                  <span>Your locations</span>
+                  <button onClick={() => setLocationOpen(false)} aria-label="Close"><X size={14} /></button>
+                </div>
+                {LOCATIONS.map((loc) => (
+                  <button
+                    key={loc}
+                    className={loc === location ? 'selected' : ''}
+                    onClick={() => chooseLocation(loc)}
+                  >
+                    <MapPin size={14} />
+                    {loc}
+                    {loc === location && <Check size={14} />}
+                  </button>
+                ))}
+                <button className="add-location" onClick={() => showToast('Manual pincode entry coming soon', 'info')}>
+                  <Plus size={14} /> Add location or pincode
+                </button>
               </div>
             )}
           </div>
+
           <div className="topbar-actions">
-            <button className="ask-ai-button" onClick={() => setAiOpen(true)}><Sparkles size={15} /> <span>Ask PriceRadar AI</span></button>
-            <span className="live-source-pill"><span className="pulse-dot" /> 10 live sources</span>
-            <button className="icon-button theme-toggle" aria-label="Toggle theme" onClick={() => setDarkMode((current) => !current)}>{darkMode ? <Sun size={18} /> : <Moon size={18} />}</button>
-            <button className="icon-button notification-button" aria-label="Notifications" onClick={() => setToast('You have 3 active price alerts')}><Bell size={19} /><i /></button>
-            <div className="topbar-avatar">AK</div>
+            <div className="live-source-pill" aria-label="All sources live">
+              <span className="pulse-dot" aria-hidden="true" />
+              All sources live
+            </div>
+
+            <button
+              className="ask-ai-button"
+              onClick={() => setAiOpen(true)}
+              aria-label="Open AI shopping assistant"
+            >
+              <Sparkles size={14} />
+              Ask AI
+            </button>
+
+            <button
+              className={`icon-button refresh-button${isRefreshing ? ' refreshing' : ''}`}
+              onClick={refreshOffers}
+              aria-label="Refresh all prices"
+              title="Refresh prices"
+            >
+              <RefreshCw size={17} />
+            </button>
+
+            <button
+              className="icon-button"
+              onClick={() => setDarkMode((d) => !d)}
+              aria-label={darkMode ? 'Switch to light mode' : 'Switch to dark mode'}
+            >
+              {darkMode ? <Sun size={18} /> : <Moon size={18} />}
+            </button>
+
+            <div className="topbar-avatar" aria-hidden="true">AK</div>
           </div>
         </header>
 
-        {activeView === 'alerts' ? (
-          <AlertsView onCompare={() => changeView('compare')} onSetAlert={() => setAlertOpen(true)} />
-        ) : activeView === 'wishlist' ? (
-          <WishlistView onProduct={(item) => { setProduct(item); setQuery(`${item.name} ${item.quantity}`); setMode(item.offers.some((offer) => offer.mode === 'instant') ? 'instant' : 'normal'); changeView('compare') }} />
-        ) : activeView === 'history' ? (
-          <HistoryView onSearch={runSearch} />
-        ) : (
-          <>
-            <section className="hero-section">
-              <div className="hero-copy">
-                <p className="eyebrow"><span className="eyebrow-spark"><Sparkles size={12} /></span> AI-powered price intelligence</p>
-                <h1>One product.<br /><em>Every price.</em> <span>One smart choice.</span></h1>
-                <p className="hero-description">Search once. See the real total from every trusted store around you — then buy with confidence.</p>
-              </div>
-              <div className="hero-proof">
-                <div className="proof-avatars"><span>AM</span><span>FL</span><span>+8</span></div>
-                <div><strong>Smarter shopping starts here</strong><span>Compare before you checkout</span></div>
-                <ShieldCheck size={19} />
-              </div>
-              <form className="search-bar" onSubmit={handleSearch}>
-                <Search size={20} className="search-icon" />
-                <input value={query} onChange={(event) => setQuery(event.target.value)} onFocus={() => setSearchOpen(true)} placeholder="Search any product, brand or ask a question..." aria-label="Search for a product" />
-                <kbd>⌘ K</kbd>
-                <button type="submit" className="search-submit"><Sparkles size={16} /> Compare prices</button>
-                {searchOpen && (
-                  <div className="search-suggestions">
-                    <div className="suggestions-heading"><span>Try asking PriceRadar</span><span>Suggestions</span></div>
-                    {searchSuggestions.map((suggestion) => <button type="button" key={suggestion.label} onMouseDown={(event) => event.preventDefault()} onClick={() => runSearch(suggestion.label)}><span className="suggestion-icon">{suggestion.icon === 'phone' ? <ShoppingBag size={15} /> : suggestion.icon === 'audio' ? <PackageCheck size={15} /> : <Sparkles size={15} />}</span><span>{suggestion.label}</span><ArrowUpRight size={14} /></button>)}
-                    <div className="suggestions-hint"><Sparkles size={13} /> You can ask for a budget, delivery time or location too</div>
-                  </div>
-                )}
-              </form>
-            </section>
+        {/* ── Views ── */}
+        {activeView === 'compare' && (
+          <CompareView
+            query={query}
+            setQuery={setQuery}
+            product={product}
+            mode={mode}
+            setMode={setMode}
+            sort={sort}
+            setSort={setSort}
+            filters={filters}
+            setFilters={setFilters}
+            showFilters={showFilters}
+            setShowFilters={setShowFilters}
+            providerFilter={providerFilter}
+            setProviderFilter={setProviderFilter}
+            filteredOffers={filteredOffers}
+            summary={summary}
+            instantCount={instantCount}
+            normalCount={normalCount}
+            isSaved={isSaved}
+            searchOpen={searchOpen}
+            setSearchOpen={setSearchOpen}
+            searchRef={searchRef}
+            onSearch={handleSearch}
+            onRun={runSearch}
+            onRefresh={refreshOffers}
+            onShare={shareComparison}
+            onWishlist={toggleWishlist}
+            onSetAlert={() => {
+              const best = Math.min(...product.offers.map((o) => finalPrice(o) ?? Infinity))
+              setAlertPrice(isFinite(best) ? String(Math.round(best * 0.9)) : '')
+              setAlertOpen(true)
+            }}
+            onSelectOffer={setSelectedOffer}
+            isRefreshing={isRefreshing}
+          />
+        )}
 
-            <div className="page-content">
-              <div className="section-heading comparison-heading">
-                <div>
-                  <p className="section-kicker"><span className="live-dot" /> LIVE MARKET SNAPSHOT</p>
-                  <h2>Compare offers</h2>
-                  <p className="section-subtitle">We found {product.offers.length} listings for <strong>{product.name}</strong></p>
-                </div>
-                <div className="heading-actions">
-                  <button className="secondary-button" onClick={shareComparison}><Share2 size={15} /> <span>Share</span></button>
-                  <button className={`secondary-button refresh-button${isRefreshing ? ' refreshing' : ''}`} onClick={refreshOffers}><RefreshCw size={15} /> <span>{isRefreshing ? 'Checking…' : 'Refresh all'}</span></button>
-                </div>
-              </div>
+        {activeView === 'overview' && (
+          <OverviewView
+            catalog={catalog}
+            alerts={alerts}
+            wishlist={wishlist}
+            onProduct={(p) => { setProduct(p); setQuery(p.name); setActiveView('compare'); setMode(p.offers.some((o) => o.mode === 'instant') ? 'instant' : 'normal') }}
+            onSetAlert={openAlertFor}
+          />
+        )}
 
-              <section className="product-overview-card">
-                <div className="product-overview-main">
-                  <div className="product-art-wrap"><ProductArt kind={product.imageKind} /></div>
-                  <div className="product-overview-copy">
-                    <div className="product-kicker"><span>{product.category}</span><span className="match-pill"><Check size={11} /> Product matched</span></div>
-                    <h3>{product.name}</h3>
-                    <p>{product.brand} <span>·</span> {product.variant} <span>·</span> {product.quantity}</p>
-                    <div className="overview-meta"><span><PackageCheck size={14} /> {product.description}</span><button onClick={() => setToast('Product details are matched using brand, variant and identifiers')}><Info size={14} /> How we match</button></div>
-                    <div className="product-actions"><button className={`save-button${saved ? ' saved' : ''}`} onClick={saveProduct}>{saved ? <Check size={15} /> : <Heart size={15} />} {saved ? 'Saved' : 'Save product'}</button><button className="text-button" onClick={() => setAlertOpen(true)}><BellRing size={15} /> Set price alert</button></div>
-                  </div>
-                </div>
-                <div className="trend-overview">
-                  <div className="trend-header"><div><span>Price trend</span><strong><TrendingDown size={16} /> {formatRupees(Math.abs(product.priceHistory.change))} lower</strong></div><span className="trend-period">{product.priceHistory.period}</span></div>
-                  <div className="trend-chart"><Sparkline points={product.priceHistory.points} /></div>
-                  <div className="trend-foot"><span>High {formatRupees(product.priceHistory.highest)}</span><span>Low {formatRupees(product.priceHistory.lowest)}</span></div>
-                </div>
-              </section>
+        {activeView === 'alerts' && (
+          <AlertsView
+            alerts={alerts}
+            catalog={catalog}
+            onDelete={(id) => { setAlerts((a) => a.filter((x) => x.id !== id)); showToast('Alert deleted', 'info') }}
+            onAdd={() => { setProduct(defaultProduct); setActiveView('compare') }}
+            onCompare={(productId) => {
+              const p = catalog.find((c) => c.id === productId)
+              if (p) { setProduct(p); setQuery(p.name); setActiveView('compare') }
+            }}
+          />
+        )}
 
-              <section className="summary-grid">
-                <SummaryMetric icon={<WalletCards size={18} />} tone="green" label="Cheapest total" offer={comparisonSummary.bestPrice} helper="after all known fees" onClick={() => setSort('price')} />
-                <SummaryMetric icon={<Zap size={18} />} tone="yellow" label="Fastest delivery" offer={comparisonSummary.fastest} helper="to your location" onClick={() => setSort('speed')} />
-                <SummaryMetric icon={<Sparkles size={18} />} tone="purple" label="Best overall" offer={comparisonSummary.bestOverall} helper="price + speed + trust" featured onClick={() => setSort('overall')} />
-                <div className="summary-savings"><div className="savings-icon"><TrendingDown size={17} /></div><div><span>Potential savings</span><strong>{savingsAgainstHighest(exactModeOffers)}</strong><small>vs. highest exact offer</small></div><ArrowUpRight size={15} /></div>
-              </section>
+        {activeView === 'wishlist' && (
+          <WishlistView
+            wishlist={wishlist}
+            catalog={catalog}
+            onProduct={(p) => { setProduct(p); setQuery(p.name); setActiveView('compare') }}
+            onRemove={(id) => { setWishlist((w) => w.filter((i) => i.productId !== id)); showToast('Removed from wishlist', 'info') }}
+          />
+        )}
 
-              <div className="mode-tabs-wrap">
-                <div className="mode-tabs" role="tablist" aria-label="Delivery mode">
-                  <button className={mode === 'instant' ? 'active' : ''} onClick={() => { setMode('instant'); setProviderFilter('all') }} role="tab"><Zap size={16} /> Instant delivery <span>{instantCount}</span></button>
-                  <button className={mode === 'normal' ? 'active' : ''} onClick={() => { setMode('normal'); setProviderFilter('all') }} role="tab"><PackageCheck size={16} /> Normal delivery <span>{normalCount}</span></button>
-                  <button className={mode === 'all' ? 'active' : ''} onClick={() => { setMode('all'); setProviderFilter('all') }} role="tab"><Globe2 size={16} /> Compare all <span>{product.offers.length}</span></button>
-                </div>
-                <div className="mode-context"><span className="context-pulse" /> Prices for <strong>{location.split(',')[0]}</strong></div>
-              </div>
-
-              <section className="offers-layout">
-                <div className="offers-panel">
-                  <div className="offers-toolbar">
-                    <div className="offers-count"><strong>{visibleOffers.length} {exactOnly ? 'exact' : 'matching'} offers</strong><span>•</span><span>Updated seconds ago</span></div>
-                    <div className="filter-actions">
-                      <label className="filter-select"><Filter size={14} /><select value={providerFilter} onChange={(event) => setProviderFilter(event.target.value)} aria-label="Filter by provider"><option value="all">All providers</option>{providers.filter((item) => mode === 'all' || (mode === 'instant' ? item.kind === 'instant' : item.kind !== 'instant')).map((item) => <option key={item.id} value={item.id}>{item.name}</option>)}</select><ChevronDown size={14} /></label>
-                      <label className="filter-select sort-select"><ListFilter size={14} /><select value={sort} onChange={(event) => setSort(event.target.value as SortKey)} aria-label="Sort offers"><option value="overall">Best overall</option><option value="price">Lowest total</option><option value="speed">Fastest first</option></select><ChevronDown size={14} /></label>
-                      <button className={`exact-toggle${exactOnly ? ' active' : ''}`} onClick={() => setExactOnly((current) => !current)}><span className="toggle-track"><span /></span> Exact only</button>
-                    </div>
-                  </div>
-                  <div className="offer-column-labels"><span>Provider & match</span><span>Item price</span><span>Delivery</span><span>Final payable</span><span /></div>
-                  {visibleOffers.length ? visibleOffers.map((offer) => <OfferCard key={offer.id} offer={offer} summary={comparisonSummary} onDetails={setSelectedOffer} />) : <EmptyOffers mode={mode} onShowNormal={() => setMode('normal')} />}
-                  <div className="provider-footnote"><ShieldCheck size={15} /><span>Only authorized or provider-approved data sources are included. Fees marked <b>At checkout</b> are not estimated.</span><button onClick={() => setToast('Learn more about PriceRadar data sources')}>Learn more <ArrowUpRight size={13} /></button></div>
-                </div>
-
-                <aside className="insights-column">
-                  <section className="ai-recommendation-card">
-                    <div className="ai-card-heading"><span className="ai-icon"><Sparkles size={16} /></span><span>Radar recommendation</span><span className="ai-live-label">AI</span></div>
-                    {comparisonSummary.bestOverall ? <><h3>{comparisonSummary.bestOverall.provider.name} is your best overall</h3><p>It balances the lowest total with a {comparisonSummary.bestOverall.etaLabel} arrival and a verified exact match.</p><div className="recommendation-total"><div><span>Payable total</span><strong>{formatRupees(finalPrice(comparisonSummary.bestOverall))}</strong></div><button onClick={() => setSelectedOffer(comparisonSummary.bestOverall!)}>See why <ArrowUpRight size={14} /></button></div></> : <><h3>No exact match yet</h3><p>Try Compare all or search for another variant to get a recommendation.</p></>}
-                    <div className="ai-card-footer"><span><ShieldCheck size={13} /> Based on actual offer data</span><button onClick={() => setAiOpen(true)}>Ask why <ChevronRight size={13} /></button></div>
-                  </section>
-
-                  <section className="price-history-card">
-                    <div className="card-section-heading"><div><span className="card-label">PRICE HISTORY</span><h3>Is now a good time?</h3></div><button className="more-button" onClick={() => setToast('Detailed price history is coming soon')}><MoreHorizontal size={17} /></button></div>
-                    <div className="history-price"><strong>{formatRupees(product.priceHistory.average)}</strong><span>average</span><em><ArrowDownRight size={13} /> {priceChangePercent(product)}% this period</em></div>
-                    <div className="history-chart"><Sparkline points={product.priceHistory.points} /></div>
-                    <p className="history-note"><span className="small-trend-icon"><TrendingDown size={12} /></span> Current price is <strong>attractive</strong> versus the {product.priceHistory.period} average.</p>
-                    <button className="outline-full-button" onClick={() => setAlertOpen(true)}><BellRing size={14} /> Alert me below {formatRupees(product.priceHistory.lowest + 1)}</button>
-                  </section>
-
-                  <section className="trust-card"><div className="trust-icon"><ShieldCheck size={17} /></div><div><strong>Transparent by design</strong><p>See every fee before you buy. No hidden markups.</p></div><button onClick={() => setToast('Every total is calculated from the provider fee breakdown')}><Info size={15} /></button></section>
-                </aside>
-              </section>
-            </div>
-          </>
+        {activeView === 'history' && (
+          <HistoryView
+            history={history}
+            catalog={catalog}
+            onSearch={(q) => runSearch(q)}
+            onClear={() => { setHistory([]); showToast('Search history cleared', 'info') }}
+          />
         )}
       </main>
 
-      {selectedOffer && <OfferDetailsModal offer={selectedOffer} onClose={() => setSelectedOffer(null)} />}
-      {alertOpen && <AlertModal product={product} price={alertPrice} setPrice={setAlertPrice} alertSet={alertSet} onClose={() => setAlertOpen(false)} onSave={() => { setAlertSet(true); setAlertOpen(false); setToast(`We'll alert you when ${product.name} drops below ₹${alertPrice}`) }} />}
-      {aiOpen && <AiPanel draft={aiDraft} setDraft={setAiDraft} onClose={() => setAiOpen(false)} onSubmit={submitAiPrompt} onPrompt={(prompt) => { setAiDraft(prompt) }} />}
-      {toast && <div className="toast"><span className="toast-icon"><Check size={15} /></span><span>{toast}</span><button onClick={() => setToast(null)}><X size={14} /></button></div>}
+      {/* ── Modals ── */}
+      {selectedOffer && (
+        <OfferModal
+          offer={selectedOffer}
+          onClose={() => setSelectedOffer(null)}
+        />
+      )}
+
+      {alertOpen && (
+        <AlertModal
+          product={product}
+          price={alertPrice}
+          setPrice={setAlertPrice}
+          existingAlert={alerts.find((a) => a.productId === product.id)}
+          onClose={() => setAlertOpen(false)}
+          onSave={() => {
+            const p = Number(alertPrice)
+            if (p > 0) saveAlert(p)
+          }}
+        />
+      )}
+
+      {aiOpen && (
+        <AiPanel
+          messages={aiMessages}
+          draft={aiDraft}
+          setDraft={setAiDraft}
+          loading={aiLoading}
+          endRef={aiEndRef}
+          onClose={() => setAiOpen(false)}
+          onSubmit={submitAiPrompt}
+          onPrompt={useAiPrompt}
+        />
+      )}
+
+      {/* ── Toast ── */}
+      {toast && (
+        <div className={`toast toast-${toast.type ?? 'info'}`} role="status" aria-live="polite">
+          {toast.type === 'success' && <Check size={15} />}
+          {toast.type === 'error'   && <AlertCircle size={15} />}
+          {(!toast.type || toast.type === 'info') && <Info size={15} />}
+          {toast.msg}
+        </div>
+      )}
     </div>
   )
 }
 
-function ProviderMark({ offer, size = 'medium' }: { offer: Offer; size?: 'small' | 'medium' | 'large' }) {
-  return <span className={`provider-mark ${size}`} style={{ '--mark-color': offer.provider.color, '--mark-bg': offer.provider.background } as CSSProperties}>{offer.provider.mark}</span>
+// ─── Compare View ─────────────────────────────────────────────────────────────
+
+interface CompareViewProps {
+  query: string; setQuery: (q: string) => void
+  product: Product; mode: Mode; setMode: (m: Mode) => void
+  sort: SortKey; setSort: (s: SortKey) => void
+  filters: FilterState; setFilters: (f: FilterState) => void
+  showFilters: boolean; setShowFilters: (v: boolean) => void
+  providerFilter: string; setProviderFilter: (v: string) => void
+  filteredOffers: Offer[]; summary: ReturnType<typeof summarize>
+  instantCount: number; normalCount: number
+  isSaved: boolean; searchOpen: boolean; setSearchOpen: (v: boolean) => void
+  searchRef: React.RefObject<HTMLInputElement>
+  onSearch: (e: FormEvent<HTMLFormElement>) => void
+  onRun: (q: string) => void; onRefresh: () => void; onShare: () => void
+  onWishlist: () => void; onSetAlert: () => void
+  onSelectOffer: (o: Offer) => void; isRefreshing: boolean
 }
 
-function ProductArt({ kind }: { kind: Product['imageKind'] }) {
-  if (kind === 'phone') return <div className="product-art phone-art"><div className="phone-shadow" /><div className="phone-device"><div className="phone-island"><i /><i /></div><span className="phone-glow" /></div></div>
-  if (kind === 'audio') return <div className="product-art audio-art"><div className="audio-case"><div className="case-lid" /><div className="earbud left"><i /></div><div className="earbud right"><i /></div><span></span></div></div>
-  if (kind === 'shampoo') return <div className="product-art shampoo-art"><div className="shampoo-shadow" /><div className="shampoo-bottle"><div className="shampoo-cap" /><span>H&S</span><strong>cool<br />menthol</strong><i /></div></div>
-  return <div className="product-art milk-art"><div className="milk-shadow" /><div className="milk-pack"><div className="milk-fold" /><span className="milk-brand">AMUL</span><strong>Taaza</strong><small>TONED MILK</small><div className="milk-splash" /><div className="milk-sun" /></div></div>
-}
+function CompareView({
+  query, setQuery, product, mode, setMode, sort, setSort,
+  filters, setFilters, showFilters, setShowFilters,
+  providerFilter, setProviderFilter,
+  filteredOffers, summary, instantCount, normalCount,
+  isSaved, searchOpen, setSearchOpen, searchRef,
+  onSearch, onRun, onRefresh, onShare, onWishlist, onSetAlert,
+  onSelectOffer, isRefreshing,
+}: CompareViewProps) {
+  const insight = priceInsight(product.priceHistory, product.priceHistory.points[product.priceHistory.points.length - 1]?.price ?? 0)
+  const disconnectedProviders = providers.filter((p) => !p.isConnected)
+  const activeProviderIds = [...new Set(product.offers.filter((o) => mode === 'all' || o.mode === mode).map((o) => o.provider.id))]
 
-function Sparkline({ points }: { points: number[] }) {
-  const min = Math.min(...points)
-  const max = Math.max(...points)
-  const range = max - min || 1
-  const coordinates = points.map((point, index) => `${(index / (points.length - 1)) * 100},${86 - ((point - min) / range) * 68}`).join(' ')
-  const lastX = 100
-  const lastY = 86 - ((points[points.length - 1] - min) / range) * 68
-  return <svg className="sparkline" viewBox="0 0 100 100" preserveAspectRatio="none" aria-label="Price trend chart" role="img"><defs><linearGradient id="spark-fill" x1="0" x2="0" y1="0" y2="1"><stop offset="0%" stopColor="#c9ef71" stopOpacity=".32" /><stop offset="100%" stopColor="#c9ef71" stopOpacity="0" /></linearGradient></defs><polygon points={`0,100 ${coordinates} 100,100`} fill="url(#spark-fill)" /><polyline points={coordinates} fill="none" stroke="#b9df68" strokeWidth="3" strokeLinecap="round" strokeLinejoin="round" /><circle cx={lastX} cy={lastY} r="3.5" fill="#c9ef71" stroke="#17232d" strokeWidth="2" /></svg>
-}
+  return (
+    <>
+      {/* Hero & Search */}
+      <section className="hero-section">
+        <div className="hero-copy">
+          <p className="eyebrow">
+            <span className="eyebrow-spark"><Sparkles size={11} /></span>
+            AI-powered price comparison
+          </p>
+          <h1>
+            One product.<br />
+            <em>Every price.</em>{' '}
+            <span>One smart choice.</span>
+          </h1>
+          <p className="hero-description">
+            PriceRadar compares the true payable price — product cost, all fees, discounts — across instant delivery and e-commerce platforms simultaneously.
+          </p>
+        </div>
 
-function SummaryMetric({ icon, tone, label, offer, helper, featured, onClick }: { icon: ReactNode; tone: string; label: string; offer?: Offer; helper: string; featured?: boolean; onClick: () => void }) {
-  return <button className={`summary-metric ${featured ? 'featured' : ''}`} onClick={onClick}><span className={`metric-icon ${tone}`}>{icon}</span><span className="metric-copy"><span className="metric-label">{label}</span><strong>{offer ? formatRupees(finalPrice(offer)) : '—'}</strong><small>{offer ? `${offer.provider.name} · ${helper}` : 'Not available for this view'}</small></span><ChevronRight size={16} className="metric-arrow" /></button>
-}
+        <div className="hero-proof">
+          <div className="proof-avatars" aria-hidden="true">
+            <span>AK</span><span>SR</span><span>RP</span>
+          </div>
+          <div>
+            <strong>{providers.filter((p) => p.isConnected).length} connected sources</strong>
+            <span>Updated just now</span>
+          </div>
+          <ShieldCheck size={18} />
+        </div>
 
-function OfferCard({ offer, summary, onDetails }: { offer: Offer; summary: ReturnType<typeof summarize>; onDetails: (offer: Offer) => void }) {
-  const isBest = offer.id === summary.bestPrice?.id
-  const isFastest = offer.id === summary.fastest?.id
-  const isOverall = offer.id === summary.bestOverall?.id
-  const total = finalPrice(offer)
-  const fees = feeTotal(offer)
-  const isLowStock = offer.availability === 'low_stock'
-  return <article className={`offer-card${isOverall ? ' recommended-offer' : ''}`}>
-    <div className="offer-grid">
-      <div className="offer-provider-cell">
-        <div className="provider-line"><ProviderMark offer={offer} /><div><strong>{offer.provider.name}</strong><span>{offer.freshness === 'live' ? <><span className="tiny-live-dot" /> Live price</> : `${offer.freshness === 'recent' ? 'Updated' : 'Cached'} ${offer.updatedSeconds}s ago`}</span></div></div>
-        <div className="match-line"><MatchBadge match={offer.match} /><button onClick={() => onDetails(offer)}>{Math.round(offer.matchScore * 100)}% match <Info size={12} /></button></div>
+        {/* Search bar */}
+        <form className="search-bar" role="search" onSubmit={onSearch}>
+          <span className="search-icon"><Search size={19} /></span>
+          <input
+            ref={searchRef}
+            value={query}
+            onChange={(e) => setQuery(e.target.value)}
+            onFocus={() => setSearchOpen(true)}
+            onBlur={() => setTimeout(() => setSearchOpen(false), 180)}
+            placeholder="Search any product, brand, or ask a question…"
+            aria-label="Search for a product"
+            autoComplete="off"
+          />
+          <kbd aria-hidden="true">⏎</kbd>
+          <button type="submit" className="search-submit">
+            <Search size={14} /> Compare now
+          </button>
+        </form>
+
+        {searchOpen && (
+          <div className="search-suggestions" role="listbox" aria-label="Search suggestions">
+            <div className="suggestions-heading">
+              <span>Trending searches</span>
+              <span>Press ↵ to search</span>
+            </div>
+            {SEARCH_SUGGESTIONS.map((s) => (
+              <button
+                key={s.label}
+                role="option"
+                onMouseDown={() => onRun(s.label)}
+              >
+                <span className="suggestion-icon"><Sparkles size={13} /></span>
+                <span>
+                  <span className="suggestion-label">{s.label}</span>
+                  <span className="suggestion-hint">{s.hint}</span>
+                </span>
+                <ArrowUpRight size={13} />
+              </button>
+            ))}
+            <div className="suggestions-hint">
+              <Sparkles size={12} /> Natural language supported — try "cheap airpods near me"
+            </div>
+          </div>
+        )}
+      </section>
+
+      <div className="page-content">
+        {/* Product overview card */}
+        <div className="section-heading">
+          <div>
+            <p className="section-kicker">
+              <span className="live-dot" aria-hidden="true" />
+              {product.offers.length} offers found
+            </p>
+            <h2>Comparing {product.name}</h2>
+            <p className="section-subtitle">
+              <strong>{product.variant}</strong> · <span>{product.quantity}</span> ·{' '}
+              <span>{product.category}</span>
+            </p>
+          </div>
+          <div className="heading-actions">
+            <button className="secondary-button" onClick={onShare}><Share2 size={14} /> Share</button>
+            <button className="secondary-button" onClick={onSetAlert}><Bell size={14} /> Set alert</button>
+            <button
+              className={`secondary-button${isSaved ? ' saved' : ''}`}
+              onClick={onWishlist}
+              aria-label={isSaved ? 'Remove from wishlist' : 'Save to wishlist'}
+            >
+              <Heart size={14} fill={isSaved ? 'currentColor' : 'none'} />
+              {isSaved ? 'Saved' : 'Save'}
+            </button>
+          </div>
+        </div>
+
+        <div className="product-overview-card">
+          <div className="product-overview-main">
+            <div className="product-art-wrap">
+              <ProductArt kind={product.imageKind} size="lg" />
+            </div>
+            <div className="product-overview-copy">
+              <div className="product-kicker">
+                <span>{product.category}</span>
+                {product.isDefinitiveMatch && (
+                  <span className="match-pill"><Check size={10} /> Verified product</span>
+                )}
+              </div>
+              <h3>{product.name}</h3>
+              <p>
+                {product.brand} <span>·</span> {product.variant} <span>·</span> {product.quantity}
+              </p>
+              {product.description && (
+                <p className="product-description">{product.description}</p>
+              )}
+              <div className="overview-meta">
+                {product.gtin && (
+                  <span><Tag size={12} /> GTIN: {product.gtin}</span>
+                )}
+                {product.sku && (
+                  <span><ShoppingBag size={12} /> SKU: {product.sku}</span>
+                )}
+                <span><Globe2 size={12} /> {product.offers.length} sources</span>
+              </div>
+              {/* Specs */}
+              {product.specs && product.specs.length > 0 && (
+                <div className="product-specs">
+                  {product.specs.map((s) => (
+                    <span key={s.label} className="spec-chip">
+                      <strong>{s.label}:</strong> {s.value}
+                    </span>
+                  ))}
+                </div>
+              )}
+            </div>
+          </div>
+
+          {/* Price history mini */}
+          <div className="trend-overview">
+            <div className="trend-head">
+              <span className="trend-label">Price trend</span>
+              <span className={`trend-badge ${product.priceHistory.trend}`}>
+                {product.priceHistory.trend === 'down' ? <TrendingDown size={12} /> : product.priceHistory.trend === 'up' ? <TrendingUp size={12} /> : <Minus size={12} />}
+                {Math.abs(product.priceHistory.changePercent)}%
+              </span>
+            </div>
+            <MiniChart history={product.priceHistory} />
+            <div className="trend-stats">
+              <div><span>Lowest</span><strong className="green">{formatRupees(product.priceHistory.lowest)}</strong></div>
+              <div><span>Average</span><strong>{formatRupees(product.priceHistory.average)}</strong></div>
+              <div><span>Highest</span><strong className="red">{formatRupees(product.priceHistory.highest)}</strong></div>
+            </div>
+            <p className="trend-insight"><Info size={11} /> {insight}</p>
+          </div>
+        </div>
+
+        {/* Comparison summary (best price / fastest / best overall) */}
+        {(summary.bestPrice || summary.fastest || summary.bestOverall) && (
+          <div className="summary-row">
+            {summary.bestPrice && (
+              <SummaryCard
+                icon={<WalletCards size={16} />}
+                label="Best Price"
+                offer={summary.bestPrice}
+                highlight="green"
+                onClick={() => onSelectOffer(summary.bestPrice!)}
+              />
+            )}
+            {summary.fastest && (
+              <SummaryCard
+                icon={<Zap size={16} />}
+                label="Fastest"
+                offer={summary.fastest}
+                highlight="blue"
+                onClick={() => onSelectOffer(summary.fastest!)}
+              />
+            )}
+            {summary.bestOverall && (
+              <SummaryCard
+                icon={<Star size={16} />}
+                label="Best Overall"
+                offer={summary.bestOverall}
+                highlight="yellow"
+                onClick={() => onSelectOffer(summary.bestOverall!)}
+              />
+            )}
+          </div>
+        )}
+
+        {/* Mode tabs + controls */}
+        <div className="controls-row">
+          <div className="mode-tabs" role="tablist" aria-label="Delivery mode">
+            {[
+              { value: 'instant' as Mode, label: '⚡ Instant', count: instantCount },
+              { value: 'normal'  as Mode, label: '📦 E-Commerce', count: normalCount },
+              { value: 'all'     as Mode, label: '🌐 Compare All', count: product.offers.length },
+            ].map(({ value, label, count }) => (
+              <button
+                key={value}
+                className={`mode-tab${mode === value ? ' active' : ''}`}
+                onClick={() => setMode(value)}
+                role="tab"
+                aria-selected={mode === value}
+              >
+                {label}
+                <span className="tab-count">{count}</span>
+              </button>
+            ))}
+          </div>
+
+          <div className="control-actions">
+            <div className="sort-wrap">
+              <label htmlFor="sort-select" className="sr-only">Sort by</label>
+              <ListFilter size={14} />
+              <select
+                id="sort-select"
+                value={sort}
+                onChange={(e) => setSort(e.target.value as SortKey)}
+              >
+                {SORT_OPTIONS.map((o) => (
+                  <option key={o.value} value={o.value}>{o.label}</option>
+                ))}
+              </select>
+            </div>
+            <button
+              className={`secondary-button${showFilters ? ' active' : ''}`}
+              onClick={() => setShowFilters(!showFilters)}
+              aria-expanded={showFilters}
+            >
+              <Filter size={13} /> Filters
+              {(filters.providers.length > 0 || filters.priceMin || filters.priceMax) && (
+                <span className="filter-badge">!</span>
+              )}
+            </button>
+            <button
+              className={`secondary-button${filters.exactOnly ? ' active' : ''}`}
+              onClick={() => setFilters({ ...filters, exactOnly: !filters.exactOnly })}
+              title={filters.exactOnly ? 'Showing exact matches only' : 'Showing all matches'}
+            >
+              <ShieldCheck size={13} />
+              {filters.exactOnly ? 'Exact only' : 'All matches'}
+            </button>
+          </div>
+        </div>
+
+        {/* Filter panel */}
+        {showFilters && (
+          <FilterPanel
+            filters={filters}
+            setFilters={setFilters}
+            activeProviderIds={activeProviderIds}
+            onReset={() => setFilters({ priceMin: '', priceMax: '', providers: [], availability: false, exactOnly: true })}
+          />
+        )}
+
+        {/* Provider filter pills */}
+        {activeProviderIds.length > 1 && (
+          <div className="provider-pills">
+            <button
+              className={`provider-pill${providerFilter === 'all' ? ' active' : ''}`}
+              onClick={() => setProviderFilter('all')}
+            >
+              All providers
+            </button>
+            {activeProviderIds.map((pid) => {
+              const prov = providers.find((p) => p.id === pid)
+              if (!prov) return null
+              return (
+                <button
+                  key={pid}
+                  className={`provider-pill${providerFilter === pid ? ' active' : ''}`}
+                  onClick={() => setProviderFilter(pid)}
+                  style={{ '--pcolor': prov.color } as CSSProperties}
+                >
+                  <span className="provider-dot" style={{ background: prov.color }} />
+                  {prov.name}
+                </button>
+              )
+            })}
+          </div>
+        )}
+
+        {/* Offers */}
+        {filteredOffers.length === 0 ? (
+          <EmptyState
+            icon={<Search size={28} />}
+            title="No offers match your filters"
+            description="Try adjusting the filters, mode, or match confidence settings."
+            action={<button className="primary-button" onClick={() => setFilters({ priceMin: '', priceMax: '', providers: [], availability: false, exactOnly: true })}>Clear filters</button>}
+          />
+        ) : (
+          <div className="offers-grid" aria-label="Price comparison results">
+            {filteredOffers.map((offer, i) => (
+              <OfferCard
+                key={offer.id}
+                offer={offer}
+                rank={i + 1}
+                isBestPrice={offer.id === summary.bestPrice?.id}
+                isFastest={offer.id === summary.fastest?.id}
+                isBestOverall={offer.id === summary.bestOverall?.id}
+                onClick={() => onSelectOffer(offer)}
+              />
+            ))}
+          </div>
+        )}
+
+        {/* Disconnected providers notice */}
+        {disconnectedProviders.length > 0 && (
+          <div className="disconnected-notice">
+            <AlertCircle size={14} />
+            <span>
+              <strong>{disconnectedProviders.length} providers unavailable:</strong>{' '}
+              {disconnectedProviders.map((p) => p.name).join(', ')} — authorized feeds pending.
+            </span>
+          </div>
+        )}
+
+        {/* Alternatives */}
+        {product.alternatives && product.alternatives.length > 0 && (
+          <div className="alternatives-section">
+            <div className="section-heading">
+              <div>
+                <p className="section-kicker"><Sparkles size={12} /> AI Recommendations</p>
+                <h2>Cheaper alternatives</h2>
+                <p className="section-subtitle">Different products — clearly labelled. Compare separately.</p>
+              </div>
+            </div>
+            <div className="alternatives-grid">
+              {product.alternatives.map((alt) => (
+                <div key={alt.id} className="alternative-card">
+                  <div className="alt-art"><ProductArt kind={alt.imageKind} size="sm" /></div>
+                  <div className="alt-copy">
+                    <div className="alt-badge">Alternative product</div>
+                    <strong>{alt.name}</strong>
+                    <span>{alt.brand} · {alt.variant} · {alt.quantity}</span>
+                    <div className="alt-price">
+                      <span className="alt-best">{formatRupees(alt.bestPrice)}</span>
+                      <span className="alt-via">at {alt.bestProvider}</span>
+                    </div>
+                    {alt.savings > 0 && (
+                      <p className="alt-savings"><TrendingDown size={12} /> Saves ₹{alt.savings.toLocaleString('en-IN')} — {alt.savingsReason}</p>
+                    )}
+                  </div>
+                  <button
+                    className="alt-compare"
+                    onClick={() => {
+                      /* In a real app this would navigate to the alt product */
+                    }}
+                  >
+                    Compare <ChevronRight size={14} />
+                  </button>
+                </div>
+              ))}
+            </div>
+          </div>
+        )}
+
+        {/* Full price history chart */}
+        <PriceHistorySection product={product} />
       </div>
-      <div className="offer-price-cell"><strong>{formatRupees(offer.price)}</strong><span><s>{formatRupees(offer.mrp)}</s><em>{discountPercent(offer)}% off</em></span><small>{offer.pricePerUnit}</small></div>
-      <div className="offer-delivery-cell"><div className="delivery-time"><Clock3 size={16} /><strong>{offer.etaLabel}</strong>{isFastest && <span className="fastest-badge">Fastest</span>}</div><span className="delivery-location"><MapPin size={12} /> {offer.location}</span><span className={`stock-status ${isLowStock ? 'low-stock' : ''}`}><i /> {offer.stockLabel}</span></div>
-      <div className="offer-total-cell"><span>Final payable</span><strong>{formatRupees(total)}</strong><small>{fees !== null ? `+ ${formatRupees(fees)} fees` : 'Fee at checkout'}</small>{isBest && <span className="offer-tag best-tag"><TrendingDown size={11} /> Best price</span>}{isOverall && !isBest && <span className="offer-tag value-tag"><Sparkles size={11} /> Best value</span>}</div>
-      <div className="offer-action-cell"><button className="details-button" onClick={() => onDetails(offer)}>Details</button><a className="shop-button" href={offer.url} target="_blank" rel="noreferrer">Shop <ArrowUpRight size={14} /></a><button className="more-button" onClick={() => onDetails(offer)} aria-label={`More details for ${offer.provider.name}`}><MoreHorizontal size={17} /></button></div>
-    </div>
-    {(isBest || isFastest || isOverall) && <div className="offer-highlights"><span className="highlight-label">Radar says</span>{isOverall && <span><Sparkles size={12} /> Best overall balance</span>}{isBest && <span><TrendingDown size={12} /> Lowest total after fees</span>}{isFastest && <span><Zap size={12} /> Reaches you in {offer.etaLabel}</span>}<span className="highlight-seller"><ShieldCheck size={12} /> {offer.seller}</span></div>}
-  </article>
+    </>
+  )
 }
+
+// ─── Summary Card ─────────────────────────────────────────────────────────────
+
+function SummaryCard({
+  icon, label, offer, highlight, onClick,
+}: { icon: ReactNode; label: string; offer: Offer; highlight: string; onClick: () => void }) {
+  const fp = finalPrice(offer)
+  return (
+    <button className={`summary-card highlight-${highlight}`} onClick={onClick}>
+      <div className="summary-icon">{icon}</div>
+      <div className="summary-copy">
+        <span className="summary-label">{label}</span>
+        <strong className="summary-provider">{offer.provider.name}</strong>
+        <span className="summary-price">{formatRupees(fp)}</span>
+        {label === 'Fastest' && <span className="summary-meta">{offer.etaLabel}</span>}
+        {label !== 'Fastest' && fp && <span className="summary-meta">incl. all fees</span>}
+      </div>
+      <div className="summary-provider-mark" style={{ background: offer.provider.color, color: offer.provider.background }}>
+        {offer.provider.mark}
+      </div>
+    </button>
+  )
+}
+
+// ─── Offer Card ───────────────────────────────────────────────────────────────
+
+function OfferCard({
+  offer, rank, isBestPrice, isFastest, isBestOverall, onClick,
+}: {
+  offer: Offer; rank: number
+  isBestPrice: boolean; isFastest: boolean; isBestOverall: boolean
+  onClick: () => void
+}) {
+  const fp = finalPrice(offer)
+  const disc = discountPercent(offer)
+  const badges: Array<{ label: string; cls: string }> = []
+  if (isBestPrice)   badges.push({ label: '🏆 Best Price',    cls: 'badge-green' })
+  if (isFastest)     badges.push({ label: '⚡ Fastest',       cls: 'badge-blue' })
+  if (isBestOverall) badges.push({ label: '💰 Best Overall',  cls: 'badge-yellow' })
+
+  return (
+    <article
+      className={`offer-card${offer.availability === 'unavailable' ? ' unavailable' : ''}${isBestOverall ? ' card-best' : ''}`}
+      aria-label={`${offer.provider.name} — ${formatRupees(fp)}`}
+    >
+      {/* Provider bar */}
+      <div className="offer-provider-bar" style={{ background: offer.provider.background }}>
+        <div className="offer-provider-mark" style={{ color: offer.provider.color }}>
+          {offer.provider.mark}
+        </div>
+        <span className="offer-provider-name" style={{ color: offer.provider.color }}>
+          {offer.provider.name}
+        </span>
+        <div className="offer-freshness">
+          {offer.freshness === 'live' ? (
+            <span className="freshness-live"><span className="tiny-live-dot" /> Live</span>
+          ) : (
+            <span className="freshness-cached">{offer.updatedSeconds}s ago</span>
+          )}
+        </div>
+      </div>
+
+      <div className="offer-body">
+        {/* Badges */}
+        {badges.length > 0 && (
+          <div className="offer-badges">
+            {badges.map((b) => (
+              <span key={b.label} className={`offer-badge ${b.cls}`}>{b.label}</span>
+            ))}
+          </div>
+        )}
+
+        {/* Product info */}
+        <div className="offer-product-row">
+          <div className="offer-product-text">
+            <strong className="offer-product-name">{offer.productName}</strong>
+            <span className="offer-product-meta">{offer.variant} · {offer.quantity}</span>
+          </div>
+          <MatchBadge match={offer.match} />
+        </div>
+
+        {/* Price */}
+        <div className="offer-price-row">
+          <div className="offer-price-main">
+            <span className="offer-final-price">{fp !== null ? formatRupees(fp) : 'See checkout'}</span>
+            {fp === null && <em className="checkout-note">Final price at checkout</em>}
+          </div>
+          <div className="offer-price-detail">
+            <span className="offer-product-price">{formatRupees(offer.price)}</span>
+            {offer.mrp > offer.price && (
+              <>
+                <span className="offer-mrp">{formatRupees(offer.mrp)}</span>
+                <span className="offer-disc">{disc}% off</span>
+              </>
+            )}
+          </div>
+        </div>
+
+        {/* Price per unit */}
+        {offer.pricePerUnit && (
+          <div className="offer-per-unit">{offer.pricePerUnit}</div>
+        )}
+
+        {/* Fee breakdown */}
+        <div className="offer-fees">
+          {offer.fees.delivery === 0
+            ? <span className="fee-free"><Check size={11} /> Free delivery</span>
+            : offer.fees.delivery !== null
+              ? <span className="fee-paid"><Truck size={11} /> ₹{offer.fees.delivery} delivery</span>
+              : <span className="fee-unknown"><Info size={11} /> Delivery at checkout</span>
+          }
+          {(offer.fees.platform ?? 0) > 0 && (
+            <span className="fee-paid">₹{offer.fees.platform} platform fee</span>
+          )}
+        </div>
+
+        {/* Delivery */}
+        <div className="offer-delivery-row">
+          <div className={`offer-eta${offer.mode === 'instant' ? ' eta-instant' : ''}`}>
+            {offer.mode === 'instant' ? <Zap size={13} /> : <Truck size={13} />}
+            {offer.etaLabel}
+            {offer.deliveryDate && <span className="eta-date">· {offer.deliveryDate}</span>}
+          </div>
+          <div className={`offer-stock ${offer.availability}`}>
+            {offer.availability === 'in_stock'   && <><Check size={11} /> {offer.stockLabel}</>}
+            {offer.availability === 'low_stock'  && <><AlertCircle size={11} /> {offer.stockLabel}</>}
+            {offer.availability === 'unavailable' && <><X size={11} /> Unavailable</>}
+          </div>
+        </div>
+
+        {/* Seller */}
+        <div className="offer-seller-row">
+          <span className="offer-seller">{offer.seller}</span>
+          {offer.rating && (
+            <span className="offer-rating">
+              <Star size={11} fill="currentColor" /> {offer.rating}
+              {offer.reviewCount && <span className="review-count">({offer.reviewCount})</span>}
+            </span>
+          )}
+        </div>
+
+        {/* Offer label */}
+        {offer.offerLabel && (
+          <div className="offer-label-tag"><Gift size={11} /> {offer.offerLabel}</div>
+        )}
+
+        {/* Actions */}
+        <div className="offer-actions">
+          <button className="offer-details-btn" onClick={onClick}>
+            View details <ChevronRight size={14} />
+          </button>
+          <a
+            className="offer-link-btn"
+            href={offer.url}
+            target="_blank"
+            rel="noreferrer"
+            aria-label={`View ${offer.productName} on ${offer.provider.name}`}
+          >
+            <ExternalLink size={14} /> Open
+          </a>
+        </div>
+      </div>
+    </article>
+  )
+}
+
+// ─── Mini Chart ───────────────────────────────────────────────────────────────
+
+function MiniChart({ history }: { history: Product['priceHistory'] }) {
+  const data = history.points.slice(-14).map((p) => ({
+    date: p.date.slice(5),  // MM-DD
+    price: p.price,
+  }))
+  if (data.length < 2) return null
+  const color = history.trend === 'down' ? '#65b88c' : history.trend === 'up' ? '#ec8d76' : '#a99ae9'
+  return (
+    <div className="mini-chart" aria-hidden="true">
+      <ResponsiveContainer width="100%" height={52}>
+        <AreaChart data={data} margin={{ top: 4, right: 2, left: 2, bottom: 0 }}>
+          <defs>
+            <linearGradient id="mcGrad" x1="0" y1="0" x2="0" y2="1">
+              <stop offset="5%" stopColor={color} stopOpacity={0.28} />
+              <stop offset="95%" stopColor={color} stopOpacity={0} />
+            </linearGradient>
+          </defs>
+          <Area type="monotone" dataKey="price" stroke={color} strokeWidth={1.8} fill="url(#mcGrad)" dot={false} />
+        </AreaChart>
+      </ResponsiveContainer>
+    </div>
+  )
+}
+
+// ─── Price History Section ────────────────────────────────────────────────────
+
+function PriceHistorySection({ product }: { product: Product }) {
+  const { priceHistory: h } = product
+  const data = h.points.map((p) => ({ date: p.date.slice(5), price: p.price }))
+  const color = h.trend === 'down' ? '#65b88c' : h.trend === 'up' ? '#ec8d76' : '#a99ae9'
+
+  return (
+    <section className="history-chart-section" aria-labelledby="history-title">
+      <div className="section-heading" style={{ marginBottom: 20 }}>
+        <div>
+          <p className="section-kicker"><History size={12} /> Price tracking</p>
+          <h2 id="history-title">Price history</h2>
+          <p className="section-subtitle">{h.period} · {data.length} data points</p>
+        </div>
+        <div className="history-summary-chips">
+          <span className="chip green">Low {formatRupees(h.lowest)}</span>
+          <span className="chip neutral">Avg {formatRupees(h.average)}</span>
+          <span className="chip red">High {formatRupees(h.highest)}</span>
+        </div>
+      </div>
+
+      <div className="history-chart-card">
+        <ResponsiveContainer width="100%" height={220}>
+          <AreaChart data={data} margin={{ top: 10, right: 20, left: 10, bottom: 0 }}>
+            <defs>
+              <linearGradient id="histGrad" x1="0" y1="0" x2="0" y2="1">
+                <stop offset="5%" stopColor={color} stopOpacity={0.3} />
+                <stop offset="95%" stopColor={color} stopOpacity={0.02} />
+              </linearGradient>
+            </defs>
+            <CartesianGrid strokeDasharray="3 3" stroke="var(--line)" />
+            <XAxis dataKey="date" tick={{ fontSize: 10, fill: 'var(--muted)' }} tickLine={false} axisLine={false} />
+            <YAxis
+              tick={{ fontSize: 10, fill: 'var(--muted)' }}
+              tickLine={false} axisLine={false}
+              tickFormatter={(v) => formatRupees(v, true)}
+              width={60}
+            />
+            <Tooltip
+              contentStyle={{ background: 'var(--surface)', border: '1px solid var(--line)', borderRadius: 10, fontSize: 12 }}
+              formatter={(v: number) => [formatRupees(v), 'Price']}
+            />
+            <ReferenceLine y={h.average} stroke="var(--muted)" strokeDasharray="4 4" label={{ value: 'Avg', fill: 'var(--muted)', fontSize: 10 }} />
+            <ReferenceLine y={h.lowest}  stroke="#65b88c" strokeDasharray="4 4" label={{ value: 'Low', fill: '#65b88c', fontSize: 10 }} />
+            <Area type="monotone" dataKey="price" stroke={color} strokeWidth={2} fill="url(#histGrad)" dot={false} activeDot={{ r: 4, fill: color }} />
+          </AreaChart>
+        </ResponsiveContainer>
+        <p className="chart-disclaimer">
+          <ShieldCheck size={12} /> Historical data from connected sources only. No values are estimated or extrapolated.
+        </p>
+      </div>
+    </section>
+  )
+}
+
+// ─── Filter Panel ─────────────────────────────────────────────────────────────
+
+function FilterPanel({
+  filters, setFilters, activeProviderIds, onReset,
+}: { filters: FilterState; setFilters: (f: FilterState) => void; activeProviderIds: string[]; onReset: () => void }) {
+  return (
+    <div className="filter-panel">
+      <div className="filter-section">
+        <strong>Price range (final)</strong>
+        <div className="price-range-inputs">
+          <input
+            type="number" placeholder="Min ₹" value={filters.priceMin}
+            onChange={(e) => setFilters({ ...filters, priceMin: e.target.value })}
+            aria-label="Minimum price"
+          />
+          <span>–</span>
+          <input
+            type="number" placeholder="Max ₹" value={filters.priceMax}
+            onChange={(e) => setFilters({ ...filters, priceMax: e.target.value })}
+            aria-label="Maximum price"
+          />
+        </div>
+      </div>
+      <div className="filter-section">
+        <strong>In stock only</strong>
+        <label className="toggle-label">
+          <input
+            type="checkbox" checked={filters.availability}
+            onChange={(e) => setFilters({ ...filters, availability: e.target.checked })}
+          />
+          <span className="toggle-switch" />
+        </label>
+      </div>
+      <div className="filter-section filter-section-wide">
+        <strong>Providers</strong>
+        <div className="filter-provider-chips">
+          {activeProviderIds.map((pid) => {
+            const p = providers.find((x) => x.id === pid)
+            if (!p) return null
+            const active = filters.providers.includes(pid)
+            return (
+              <button
+                key={pid}
+                className={`filter-chip${active ? ' active' : ''}`}
+                onClick={() =>
+                  setFilters({
+                    ...filters,
+                    providers: active
+                      ? filters.providers.filter((x) => x !== pid)
+                      : [...filters.providers, pid],
+                  })
+                }
+                style={{ '--pcolor': p.color } as CSSProperties}
+              >
+                {p.name}
+              </button>
+            )
+          })}
+        </div>
+      </div>
+      <button className="filter-reset" onClick={onReset}><X size={13} /> Reset filters</button>
+    </div>
+  )
+}
+
+// ─── Match Badge ──────────────────────────────────────────────────────────────
 
 function MatchBadge({ match }: { match: MatchLevel }) {
-  const labels: Record<MatchLevel, string> = { exact: 'Exact match', likely: 'Likely match', similar: 'Similar product' }
-  return <span className={`match-badge ${match}`}><span />{labels[match]}</span>
+  const label = matchLevelToConfidence(match)
+  const cls = match === 'exact' ? 'match-exact' : match === 'likely' ? 'match-likely' : 'match-similar'
+  const icon = match === 'exact' ? <Check size={10} /> : match === 'likely' ? <Eye size={10} /> : <AlertCircle size={10} />
+  return <span className={`match-badge ${cls}`} title={label}>{icon} {label}</span>
 }
 
-function EmptyOffers({ mode, onShowNormal }: { mode: Mode; onShowNormal: () => void }) {
-  return <div className="empty-offers"><span className="empty-icon"><Radar size={24} /></span><h3>No exact {mode === 'instant' ? 'instant-delivery' : 'matching'} offers here</h3><p>We won't rank similar products as exact. Try normal delivery or turn off “Exact only” to inspect other matches.</p><button onClick={onShowNormal}>View normal delivery <ArrowRight size={15} /></button></div>
+// ─── Product Art ──────────────────────────────────────────────────────────────
+
+const PRODUCT_ART: Record<string, { bg: string; emoji: string }> = {
+  milk:      { bg: '#eef5f0', emoji: '🥛' },
+  phone:     { bg: '#e8eef8', emoji: '📱' },
+  audio:     { bg: '#f0ecf8', emoji: '🎧' },
+  shampoo:   { bg: '#f5f0e8', emoji: '🧴' },
+  rice:      { bg: '#f8f4e8', emoji: '🌾' },
+  detergent: { bg: '#e8f5f0', emoji: '🧺' },
+  default:   { bg: '#f0f2ee', emoji: '📦' },
 }
 
-function savingsAgainstHighest(offers: Offer[]): string {
-  const totals = offers.filter((offer) => offer.match === 'exact').map((offer) => finalPrice(offer)).filter((total): total is number => total !== null)
-  if (totals.length < 2) return '—'
-  return formatRupees(Math.max(...totals) - Math.min(...totals))
+function ProductArt({ kind, size = 'md' }: { kind: string; size?: 'sm' | 'md' | 'lg' }) {
+  const art = PRODUCT_ART[kind] ?? PRODUCT_ART.default
+  const fontSize = size === 'lg' ? 54 : size === 'sm' ? 28 : 40
+  return (
+    <div className={`product-art product-art-${size}`} style={{ background: art.bg }} aria-hidden="true">
+      <span style={{ fontSize }}>{art.emoji}</span>
+    </div>
+  )
 }
 
-function priceChangePercent(product: Product): number {
-  return Math.round((Math.abs(product.priceHistory.change) / product.priceHistory.average) * 100)
+// ─── Overview View ────────────────────────────────────────────────────────────
+
+function OverviewView({
+  catalog, alerts, wishlist, onProduct, onSetAlert,
+}: {
+  catalog: Product[]
+  alerts: PriceAlert[]
+  wishlist: WishlistItem[]
+  onProduct: (p: Product) => void
+  onSetAlert: (p: Product) => void
+}) {
+  const totalSavings = catalog.reduce((sum, p) => {
+    const best = Math.min(...p.offers.map((o) => finalPrice(o) ?? Infinity))
+    const mrp  = Math.min(...p.offers.map((o) => o.mrp))
+    return sum + Math.max(0, mrp - best)
+  }, 0)
+
+  return (
+    <div className="page-content utility-page">
+      <div className="utility-page-head">
+        <div>
+          <p className="eyebrow"><span className="eyebrow-spark"><LayoutDashboard size={12} /></span> Your dashboard</p>
+          <h1>Overview</h1>
+          <p>Live snapshot of all products in your workspace.</p>
+        </div>
+      </div>
+
+      <div className="utility-stats">
+        <div>
+          <span className="utility-stat-icon green"><TrendingDown size={17} /></span>
+          <div><strong>{formatRupees(totalSavings, true)}</strong><small>potential savings vs MRP</small></div>
+        </div>
+        <div>
+          <span className="utility-stat-icon yellow"><BellRing size={17} /></span>
+          <div><strong>{alerts.filter((a) => a.status === 'active').length} active</strong><small>price alerts watching</small></div>
+        </div>
+        <div>
+          <span className="utility-stat-icon purple"><Heart size={17} /></span>
+          <div><strong>{wishlist.length} saved</strong><small>products in wishlist</small></div>
+        </div>
+        <div>
+          <span className="utility-stat-icon blue"><Globe2 size={17} /></span>
+          <div><strong>{providers.filter((p) => p.isConnected).length} sources</strong><small>connected &amp; active</small></div>
+        </div>
+      </div>
+
+      <section className="overview-products-section">
+        <div className="section-heading">
+          <div>
+            <p className="section-kicker">All tracked products</p>
+            <h2>Product catalog</h2>
+          </div>
+        </div>
+        <div className="overview-grid">
+          {catalog.map((p) => {
+            const best   = Math.min(...p.offers.map((o) => finalPrice(o) ?? Infinity))
+            const mrp    = p.offers[0]?.mrp ?? 0
+            const saving = Math.max(0, mrp - best)
+            const prov   = p.offers.find((o) => finalPrice(o) === best)?.provider
+            return (
+              <div key={p.id} className="overview-card">
+                <div className="ov-art"><ProductArt kind={p.imageKind} size="sm" /></div>
+                <div className="ov-copy">
+                  <span className="ov-category">{p.category}</span>
+                  <strong className="ov-name">{p.name}</strong>
+                  <span className="ov-meta">{p.variant} · {p.quantity}</span>
+                  <div className="ov-price-row">
+                    <span className="ov-best">{formatRupees(isFinite(best) ? best : null)}</span>
+                    {saving > 0 && <span className="ov-saving">-₹{saving.toLocaleString('en-IN')}</span>}
+                  </div>
+                  {prov && (
+                    <span className="ov-provider" style={{ color: prov.color, background: prov.background }}>
+                      {prov.name}
+                    </span>
+                  )}
+                  <div className="ov-trend">
+                    {p.priceHistory.trend === 'down' ? <TrendingDown size={12} className="green" /> : p.priceHistory.trend === 'up' ? <TrendingUp size={12} className="red" /> : <Minus size={12} />}
+                    <span>{Math.abs(p.priceHistory.changePercent)}% {p.priceHistory.period}</span>
+                  </div>
+                </div>
+                <div className="ov-actions">
+                  <button className="primary-button" onClick={() => onProduct(p)}>Compare</button>
+                  <button className="secondary-button" onClick={() => onSetAlert(p)}><Bell size={13} /></button>
+                </div>
+              </div>
+            )
+          })}
+        </div>
+      </section>
+
+      {/* Connected providers */}
+      <section>
+        <div className="section-heading" style={{ marginBottom: 16 }}>
+          <div>
+            <p className="section-kicker">Integration status</p>
+            <h2>Provider network</h2>
+          </div>
+        </div>
+        <div className="provider-status-grid">
+          {providers.map((p) => (
+            <div key={p.id} className={`provider-status-card${p.isConnected ? ' connected' : ' disconnected'}`}>
+              <div className="psc-mark" style={{ background: p.background, color: p.color }}>{p.mark}</div>
+              <div className="psc-info">
+                <strong>{p.name}</strong>
+                <span>{p.kind}</span>
+              </div>
+              <div className={`psc-status${p.isConnected ? ' ok' : ''}`}>
+                {p.isConnected ? <><Check size={12} /> Active</> : <><X size={12} /> Pending</>}
+              </div>
+            </div>
+          ))}
+        </div>
+      </section>
+    </div>
+  )
 }
 
-function OfferDetailsModal({ offer, onClose }: { offer: Offer; onClose: () => void }) {
-  const feeRows = [
-    ['Product price', offer.price],
-    ['Delivery fee', offer.fees.delivery],
-    ['Platform / service fee', offer.fees.platform],
-    ['Handling charge', offer.fees.handling],
-    ['Other applicable charges', offer.fees.other],
-  ] as Array<[string, number | null]>
-  return <div className="modal-backdrop" onMouseDown={onClose}><section className="detail-modal" role="dialog" aria-modal="true" aria-label="Offer details" onMouseDown={(event) => event.stopPropagation()}><div className="modal-header"><div><p className="modal-kicker">PRICE BREAKDOWN</p><h2>{offer.provider.name} offer</h2></div><button className="modal-close" onClick={onClose} aria-label="Close details"><X size={18} /></button></div><div className="modal-provider"><ProviderMark offer={offer} size="large" /><div><strong>{offer.productName}</strong><span>{offer.variant} · {offer.quantity}</span><div><MatchBadge match={offer.match} /><span className="modal-freshness"><span className="tiny-live-dot" /> {offer.freshness === 'live' ? 'Live source' : `Updated ${offer.updatedSeconds}s ago`}</span></div></div></div><div className="breakdown-box"><div className="breakdown-head"><span>Transparent total</span><span>{offer.etaLabel} delivery</span></div>{feeRows.map(([label, value]) => <div className="breakdown-row" key={label}><span>{label}{label === 'Product price' && <small>MRP {formatRupees(offer.mrp)}</small>}</span><strong>{value === null ? <em>At checkout</em> : formatRupees(value)}</strong></div>)}<div className="breakdown-total"><span>Final payable price</span><strong>{formatRupees(finalPrice(offer))}</strong></div></div>{offer.fees.note && <p className="fee-note"><Info size={14} /> {offer.fees.note}</p>}<div className="modal-facts"><div><span>Sold by</span><strong>{offer.seller}</strong></div><div><span>Availability</span><strong className="available-copy"><i /> {offer.stockLabel}</strong></div><div><span>Return policy</span><strong>{offer.returnPolicy ?? 'Provider policy'}</strong></div><div><span>Match confidence</span><strong>{Math.round(offer.matchScore * 100)}% <button onClick={() => undefined}><CircleHelp size={13} /></button></strong></div></div><div className="modal-actions"><a className="primary-modal-button" href={offer.url} target="_blank" rel="noreferrer">View on {offer.provider.name} <ExternalLink size={15} /></a><button className="secondary-modal-button" onClick={onClose}>Keep comparing</button></div><p className="modal-disclaimer"><ShieldCheck size={13} /> Price and stock can change at checkout. Last checked {offer.updatedSeconds} seconds ago.</p></section></div>
+// ─── Alerts View ──────────────────────────────────────────────────────────────
+
+function AlertsView({
+  alerts, catalog, onDelete, onAdd, onCompare,
+}: { alerts: PriceAlert[]; catalog: Product[]; onDelete: (id: string) => void; onAdd: () => void; onCompare: (id: string) => void }) {
+  return (
+    <div className="page-content utility-page">
+      <div className="utility-page-head">
+        <div>
+          <p className="eyebrow"><span className="eyebrow-spark"><BellRing size={12} /></span> Never overpay</p>
+          <h1>Price alerts</h1>
+          <p>PriceRadar is watching {alerts.filter((a) => a.status === 'active').length} products across connected stores.</p>
+        </div>
+        <button className="primary-button" onClick={onAdd}><Plus size={16} /> Track a product</button>
+      </div>
+
+      {alerts.length === 0 ? (
+        <EmptyState
+          icon={<BellRing size={28} />}
+          title="No price alerts yet"
+          description="Search for a product and tap 'Set alert' to start tracking its price."
+          action={<button className="primary-button" onClick={onAdd}><Plus size={15} /> Track a product</button>}
+        />
+      ) : (
+        <section className="alerts-table-card">
+          <div className="utility-card-head">
+            <span className="card-label">ACTIVE WATCHLIST</span>
+            <h2>Products you're watching</h2>
+          </div>
+          {alerts.map((alert) => {
+            const product = catalog.find((p) => p.id === alert.productId)
+            const pct = Math.round(((alert.currentBest - alert.targetPrice) / alert.targetPrice) * 100)
+            const reached = alert.currentBest <= alert.targetPrice
+            return (
+              <div key={alert.id} className="alert-row">
+                <div className="alert-product-art">
+                  {product && <ProductArt kind={product.imageKind} size="sm" />}
+                </div>
+                <div className="alert-product">
+                  <strong>{alert.productName}</strong>
+                  <span>Set {fmtDate(alert.createdAt)}</span>
+                </div>
+                <div className="alert-target">
+                  <span>Target</span>
+                  <strong>{formatRupees(alert.targetPrice)}</strong>
+                </div>
+                <div className="alert-current">
+                  <span>Best now</span>
+                  <strong>{formatRupees(alert.currentBest)}</strong>
+                </div>
+                <div className={`alert-progress-copy${reached ? ' reached' : ''}`}>
+                  {reached ? <Check size={14} /> : <Clock3 size={14} />}
+                  {reached ? 'Target reached!' : `₹${(alert.currentBest - alert.targetPrice).toLocaleString('en-IN')} to go`}
+                </div>
+                <div className="alert-row-actions">
+                  <button className="secondary-button" onClick={() => onCompare(alert.productId)}>Compare</button>
+                  <button className="icon-button danger" onClick={() => onDelete(alert.id)} aria-label="Delete alert"><X size={15} /></button>
+                </div>
+              </div>
+            )
+          })}
+        </section>
+      )}
+    </div>
+  )
 }
 
-function AlertModal({ product, price, setPrice, alertSet, onClose, onSave }: { product: Product; price: string; setPrice: (value: string) => void; alertSet: boolean; onClose: () => void; onSave: () => void }) {
-  return <div className="modal-backdrop" onMouseDown={onClose}><section className="alert-modal" role="dialog" aria-modal="true" aria-label="Set a price alert" onMouseDown={(event) => event.stopPropagation()}><button className="modal-close" onClick={onClose} aria-label="Close alert dialog"><X size={18} /></button><div className="alert-modal-icon"><BellRing size={20} /></div><p className="modal-kicker">PRICE ALERT</p><h2>Let the radar watch it.</h2><p className="alert-intro">We'll check connected sources and let you know when <strong>{product.name}</strong> falls below your target.</p><label className="target-price-label">Alert me below <span><span>₹</span><input value={price} onChange={(event) => setPrice(event.target.value.replace(/[^0-9]/g, ''))} inputMode="numeric" aria-label="Target price" /></span></label><div className="alert-current"><span>Best available now</span><strong>{formatRupees(Math.min(...product.offers.map((offer) => finalPrice(offer) ?? Infinity)))}</strong></div><button className="save-alert-button" onClick={onSave}>{alertSet ? <Check size={16} /> : <BellRing size={16} />} {alertSet ? 'Alert saved' : 'Save price alert'}</button><p className="alert-fineprint"><ShieldCheck size={12} /> You can manage alerts anytime from Price alerts</p></section></div>
+// ─── Wishlist View ────────────────────────────────────────────────────────────
+
+function WishlistView({
+  wishlist, catalog, onProduct, onRemove,
+}: { wishlist: WishlistItem[]; catalog: Product[]; onProduct: (p: Product) => void; onRemove: (id: string) => void }) {
+  const items = wishlist.map((w) => catalog.find((c) => c.id === w.productId)).filter(Boolean) as Product[]
+
+  return (
+    <div className="page-content utility-page">
+      <div className="utility-page-head">
+        <div>
+          <p className="eyebrow"><span className="eyebrow-spark"><Heart size={12} /></span> Your saved buys</p>
+          <h1>Wishlist</h1>
+          <p>Track products you're considering. PriceRadar watches their prices.</p>
+        </div>
+      </div>
+
+      {items.length === 0 ? (
+        <EmptyState
+          icon={<Heart size={28} />}
+          title="Your wishlist is empty"
+          description="Search for a product and tap the heart icon to save it here."
+        />
+      ) : (
+        <div className="wishlist-grid">
+          {items.map((item) => {
+            const best = Math.min(...item.offers.map((o) => finalPrice(o) ?? Infinity))
+            const prov = item.offers.find((o) => finalPrice(o) === best)?.provider
+            return (
+              <div key={item.id} className="wishlist-card">
+                <button className="wishlist-remove" onClick={() => onRemove(item.id)} aria-label="Remove from wishlist">
+                  <X size={14} />
+                </button>
+                <button className="wishlist-inner" onClick={() => onProduct(item)}>
+                  <div className="wishlist-art"><ProductArt kind={item.imageKind} size="md" /></div>
+                  <div className="wishlist-copy">
+                    <span className="wishlist-category">{item.category}</span>
+                    <h3>{item.name}</h3>
+                    <p>{item.variant} · {item.quantity}</p>
+                    <strong>{formatRupees(isFinite(best) ? best : null)}</strong>
+                    {prov && <span className="wishlist-provider" style={{ color: prov.color, background: prov.background }}>{prov.name}</span>}
+                    <small>best total across {item.offers.length} offers <ArrowUpRight size={12} /></small>
+                  </div>
+                </button>
+                <button className="primary-button wishlist-compare" onClick={() => onProduct(item)}>
+                  Compare prices
+                </button>
+              </div>
+            )
+          })}
+        </div>
+      )}
+    </div>
+  )
 }
 
-function AiPanel({ draft, setDraft, onClose, onSubmit, onPrompt }: { draft: string; setDraft: (value: string) => void; onClose: () => void; onSubmit: (event: FormEvent<HTMLFormElement>) => void; onPrompt: (prompt: string) => void }) {
-  const prompts = ['Find the cheapest iPhone 16 near me', 'Best deal under ₹1,000 delivered in 30 min', 'Compare this with Amazon']
-  return <div className="ai-panel-backdrop" onMouseDown={onClose}><section className="ai-panel" onMouseDown={(event) => event.stopPropagation()}><div className="ai-panel-header"><div className="ai-panel-title"><span className="ai-icon large"><Sparkles size={17} /></span><div><strong>PriceRadar AI</strong><span>Your shopping co-pilot</span></div></div><button className="modal-close" onClick={onClose}><X size={18} /></button></div><div className="ai-chat"><div className="ai-message assistant"><span className="message-avatar"><Radar size={14} /></span><div><p>Tell me what you want to buy, your budget, or how fast you need it. I’ll compare the real totals — not just sticker prices.</p><span className="message-time">Just now</span></div></div><div className="prompt-chips">{prompts.map((prompt) => <button key={prompt} onClick={() => onPrompt(prompt)}>{prompt}<ArrowUpRight size={13} /></button>)}</div></div><form className="ai-input-wrap" onSubmit={onSubmit}><input autoFocus value={draft} onChange={(event) => setDraft(event.target.value)} placeholder="Ask anything about a product..." /><button type="submit" aria-label="Send prompt"><ArrowUpRight size={17} /></button></form><p className="ai-disclaimer"><Info size={12} /> Recommendations use the latest connected offer data and show their sources.</p></section></div>
+// ─── History View ─────────────────────────────────────────────────────────────
+
+function HistoryView({
+  history, catalog, onSearch, onClear,
+}: { history: SearchHistoryEntry[]; catalog: Product[]; onSearch: (q: string) => void; onClear: () => void }) {
+  return (
+    <div className="page-content utility-page">
+      <div className="utility-page-head">
+        <div>
+          <p className="eyebrow"><span className="eyebrow-spark"><History size={12} /></span> Pick up where you left off</p>
+          <h1>Search history</h1>
+          <p>Your recent comparisons, kept in one place.</p>
+        </div>
+        <button className="secondary-button" onClick={onClear}><X size={14} /> Clear history</button>
+      </div>
+
+      {history.length === 0 ? (
+        <EmptyState
+          icon={<History size={28} />}
+          title="No search history yet"
+          description="Once you search for products, your comparisons will appear here."
+        />
+      ) : (
+        <section className="history-list-card">
+          {history.map((item, i) => {
+            const product = catalog.find((c) => c.id === item.productId)
+            return (
+              <button key={`${item.query}-${i}`} className="history-row" onClick={() => onSearch(item.query)}>
+                <div className="history-number">
+                  {String(i + 1).padStart(2, '0')}
+                </div>
+                {product && (
+                  <div className="history-thumb"><ProductArt kind={product.imageKind} size="sm" /></div>
+                )}
+                <div className="history-query">
+                  <strong>{item.query}</strong>
+                  <span>{item.offerCount} offers · {fmtRelTime(item.timestamp)}</span>
+                </div>
+                {item.bestTotal !== undefined && (
+                  <div className="history-best">
+                    <span>Best total</span>
+                    <strong>{formatRupees(item.bestTotal)}</strong>
+                  </div>
+                )}
+                <ArrowRight size={17} />
+              </button>
+            )
+          })}
+        </section>
+      )}
+    </div>
+  )
 }
 
-function AlertsView({ onCompare, onSetAlert }: { onCompare: () => void; onSetAlert: () => void }) {
-  return <div className="page-content utility-page"><div className="utility-page-head"><div><p className="eyebrow"><span className="eyebrow-spark"><BellRing size={12} /></span> Never miss a better price</p><h1>Your price alerts</h1><p>PriceRadar is watching 3 products across connected stores.</p></div><button className="primary-button" onClick={onCompare}><Plus size={16} /> Track a product</button></div><div className="utility-stats"><div><span className="utility-stat-icon green"><TrendingDown size={17} /></span><div><strong>₹1,842</strong><small>saved by alerts this month</small></div></div><div><span className="utility-stat-icon yellow"><BellRing size={17} /></span><div><strong>3 active</strong><small>products being watched</small></div></div><div><span className="utility-stat-icon purple"><Zap size={17} /></span><div><strong>10 sources</strong><small>checked automatically</small></div></div></div><section className="alerts-table-card"><div className="utility-card-head"><div><span className="card-label">ACTIVE WATCHLIST</span><h2>Products you’re watching</h2></div><button className="secondary-button" onClick={onSetAlert}><Plus size={15} /> New alert</button></div><AlertRow product={catalog[0]} target="₹55" current="₹67" change="₹3 below average" /><AlertRow product={catalog[1]} target="₹68,000" current="₹69,499" change="₹1,500 to go" /><AlertRow product={catalog[2]} target="₹17,500" current="₹18,499" change="₹999 to go" /></section></div>
+// ─── Offer Modal ──────────────────────────────────────────────────────────────
+
+function OfferModal({ offer, onClose }: { offer: Offer; onClose: () => void }) {
+  const feeRows = buildFeeRows(offer)
+  const fp = finalPrice(offer)
+  const disc = discountPercent(offer)
+
+  useEffect(() => {
+    const handler = (e: globalThis.KeyboardEvent) => { if (e.key === 'Escape') onClose() }
+    document.addEventListener('keydown', handler)
+    return () => document.removeEventListener('keydown', handler)
+  }, [onClose])
+
+  return (
+    <div className="modal-backdrop" onMouseDown={onClose} role="dialog" aria-modal="true" aria-label="Offer details">
+      <section className="offer-modal" onMouseDown={(e) => e.stopPropagation()}>
+        <button className="modal-close" onClick={onClose} aria-label="Close"><X size={18} /></button>
+
+        <div className="modal-provider-bar" style={{ background: offer.provider.background }}>
+          <span className="modal-provider-mark" style={{ color: offer.provider.color }}>{offer.provider.mark}</span>
+          <span className="modal-provider-name" style={{ color: offer.provider.color }}>{offer.provider.name}</span>
+          <MatchBadge match={offer.match} />
+        </div>
+
+        <div className="modal-body">
+          <div className="modal-product">
+            <div className="modal-product-info">
+              <strong>{offer.productName}</strong>
+              <span>{offer.variant} · {offer.quantity}</span>
+              <div className="modal-meta-row">
+                <MatchBadge match={offer.match} />
+                <span className="modal-freshness">
+                  {offer.freshness === 'live'
+                    ? <><span className="tiny-live-dot" aria-hidden="true" /> Live source</>
+                    : <>Updated {offer.updatedSeconds}s ago</>
+                  }
+                </span>
+              </div>
+            </div>
+          </div>
+
+          {/* Transparent breakdown */}
+          <div className="breakdown-box">
+            <div className="breakdown-head">
+              <span>Transparent total</span>
+              <span>{offer.etaLabel} delivery</span>
+            </div>
+            {feeRows.map(([label, value]) => (
+              <div className="breakdown-row" key={label}>
+                <span>
+                  {label}
+                  {label === 'Product price' && offer.mrp > offer.price && (
+                    <small> MRP {formatRupees(offer.mrp)}</small>
+                  )}
+                </span>
+                <strong>
+                  {value === null ? <em>At checkout</em> : (
+                    <span style={{ color: typeof value === 'number' && value < 0 ? '#65b88c' : undefined }}>
+                      {typeof value === 'number' && value < 0 ? `-${formatRupees(-value)}` : formatRupees(value as number)}
+                    </span>
+                  )}
+                </strong>
+              </div>
+            ))}
+            <div className="breakdown-total">
+              <span>Final payable price</span>
+              <strong>{formatRupees(fp)}</strong>
+            </div>
+            {fp === null && (
+              <p className="checkout-warning"><AlertCircle size={12} /> Final amount not known until checkout</p>
+            )}
+          </div>
+
+          {offer.fees.note && (
+            <p className="fee-note"><Info size={13} /> {offer.fees.note}</p>
+          )}
+
+          {/* Seller & facts */}
+          <div className="modal-facts">
+            <div><span>Sold by</span><strong>{offer.seller}</strong></div>
+            <div>
+              <span>Availability</span>
+              <strong className={`avail-${offer.availability}`}>
+                {offer.availability === 'in_stock'   ? '● In stock'    : ''}
+                {offer.availability === 'low_stock'  ? '● Low stock'   : ''}
+                {offer.availability === 'unavailable' ? '● Unavailable' : ''}
+              </strong>
+            </div>
+            {offer.returnPolicy && <div><span>Return policy</span><strong>{offer.returnPolicy}</strong></div>}
+            {offer.warranty     && <div><span>Warranty</span><strong>{offer.warranty}</strong></div>}
+            <div>
+              <span>Match confidence</span>
+              <strong>{Math.round(offer.matchScore * 100)}%</strong>
+            </div>
+            <div><span>Match reason</span><strong>{offer.matchReason}</strong></div>
+          </div>
+
+          {offer.rating && (
+            <div className="modal-rating">
+              <Star size={14} fill="currentColor" style={{ color: '#f4cb63' }} />
+              <strong>{offer.rating}</strong>
+              {offer.reviewCount && <span>({offer.reviewCount} reviews)</span>}
+            </div>
+          )}
+
+          <div className="modal-actions">
+            <a className="primary-modal-button" href={offer.url} target="_blank" rel="noreferrer">
+              View on {offer.provider.name} <ExternalLink size={15} />
+            </a>
+            <button className="secondary-modal-button" onClick={onClose}>Keep comparing</button>
+          </div>
+
+          <p className="modal-disclaimer">
+            <ShieldCheck size={12} /> Price and availability can change at checkout. Last checked {offer.updatedSeconds}s ago.
+          </p>
+        </div>
+      </section>
+    </div>
+  )
 }
 
-function AlertRow({ product, target, current, change }: { product: Product; target: string; current: string; change: string }) {
-  return <div className="alert-row"><div className="alert-product-art"><ProductArt kind={product.imageKind} /></div><div className="alert-product"><strong>{product.name}</strong><span>{product.variant} · {product.quantity}</span></div><div className="alert-target"><span>Target</span><strong>{target}</strong></div><div className="alert-current"><span>Best now</span><strong>{current}</strong></div><div className={`alert-progress-copy${change.includes('below') ? ' reached' : ''}`}>{change.includes('below') ? <Check size={14} /> : <Clock3 size={14} />}{change}</div><button className="more-button"><MoreHorizontal size={17} /></button></div>
+// ─── Alert Modal ──────────────────────────────────────────────────────────────
+
+function AlertModal({
+  product, price, setPrice, existingAlert, onClose, onSave,
+}: {
+  product: Product; price: string; setPrice: (v: string) => void
+  existingAlert?: PriceAlert; onClose: () => void; onSave: () => void
+}) {
+  const best = Math.min(...product.offers.map((o) => finalPrice(o) ?? Infinity))
+
+  useEffect(() => {
+    const handler = (e: globalThis.KeyboardEvent) => { if (e.key === 'Escape') onClose() }
+    document.addEventListener('keydown', handler)
+    return () => document.removeEventListener('keydown', handler)
+  }, [onClose])
+
+  return (
+    <div className="modal-backdrop" onMouseDown={onClose} role="dialog" aria-modal="true" aria-label="Set a price alert">
+      <section className="alert-modal" onMouseDown={(e) => e.stopPropagation()}>
+        <button className="modal-close" onClick={onClose} aria-label="Close"><X size={18} /></button>
+        <div className="alert-modal-icon"><BellRing size={20} /></div>
+        <p className="modal-kicker">PRICE ALERT</p>
+        <h2>Let the radar watch it.</h2>
+        <p className="alert-intro">
+          We'll check connected sources and notify you when{' '}
+          <strong>{product.name}</strong> drops below your target price.
+        </p>
+
+        <label className="target-price-label" htmlFor="alert-price-input">
+          Alert me below
+          <span>
+            <span aria-hidden="true">₹</span>
+            <input
+              id="alert-price-input"
+              value={price}
+              onChange={(e) => setPrice(e.target.value.replace(/[^0-9]/g, ''))}
+              inputMode="numeric"
+              aria-label="Target price in rupees"
+              autoFocus
+            />
+          </span>
+        </label>
+
+        <div className="alert-current">
+          <span>Best available now</span>
+          <strong>{formatRupees(isFinite(best) ? best : null)}</strong>
+        </div>
+
+        <button className="save-alert-button" onClick={onSave}>
+          <BellRing size={16} />
+          {existingAlert ? 'Update alert' : 'Save price alert'}
+        </button>
+
+        <p className="alert-fineprint">
+          <ShieldCheck size={12} /> Manage alerts anytime from the Price alerts view.
+        </p>
+      </section>
+    </div>
+  )
 }
 
-function WishlistView({ onProduct }: { onProduct: (product: Product) => void }) {
-  return <div className="page-content utility-page"><div className="utility-page-head"><div><p className="eyebrow"><span className="eyebrow-spark"><Heart size={12} /></span> Your saved buys</p><h1>Wishlist</h1><p>Keep an eye on the products you’re considering.</p></div><button className="secondary-button" onClick={() => undefined}><Share2 size={15} /> Share wishlist</button></div><div className="wishlist-grid">{catalog.map((item) => <button key={item.id} className="wishlist-card" onClick={() => onProduct(item)}><div className="wishlist-art"><ProductArt kind={item.imageKind} /></div><div className="wishlist-copy"><div><span>{item.category}</span><Heart size={15} fill="currentColor" /></div><h3>{item.name}</h3><p>{item.variant} · {item.quantity}</p><strong>{formatRupees(Math.min(...item.offers.map((offer) => finalPrice(offer) ?? Infinity)))}</strong><small>best total across {item.offers.length} offers <ArrowUpRight size={12} /></small></div></button>)}</div></div>
+// ─── AI Panel ─────────────────────────────────────────────────────────────────
+
+function AiPanel({
+  messages, draft, setDraft, loading, endRef, onClose, onSubmit, onPrompt,
+}: {
+  messages: AiMessage[]
+  draft: string; setDraft: (v: string) => void
+  loading: boolean
+  endRef: React.RefObject<HTMLDivElement>
+  onClose: () => void
+  onSubmit: (e: FormEvent<HTMLFormElement>) => void
+  onPrompt: (p: string) => void
+}) {
+  useEffect(() => {
+    const handler = (e: globalThis.KeyboardEvent) => { if (e.key === 'Escape') onClose() }
+    document.addEventListener('keydown', handler)
+    return () => document.removeEventListener('keydown', handler)
+  }, [onClose])
+
+  return (
+    <div className="ai-panel-backdrop" onMouseDown={onClose} role="dialog" aria-modal="true" aria-label="AI shopping assistant">
+      <section className="ai-panel" onMouseDown={(e) => e.stopPropagation()}>
+        <div className="ai-panel-header">
+          <div className="ai-panel-title">
+            <span className="ai-icon large"><Sparkles size={17} /></span>
+            <div>
+              <strong>PriceRadar AI</strong>
+              <span>Grounded in real price data</span>
+            </div>
+          </div>
+          <button className="modal-close" onClick={onClose} aria-label="Close AI panel"><X size={18} /></button>
+        </div>
+
+        <div className="ai-chat">
+          {messages.length === 0 && (
+            <div className="ai-message assistant">
+              <span className="message-avatar"><Radar size={14} /></span>
+              <div>
+                <p>
+                  Tell me what you want to buy, your budget, or how fast you need it.
+                  I'll compare real totals — not just sticker prices. I only use data from connected sources.
+                </p>
+                <span className="message-time">Just now</span>
+              </div>
+            </div>
+          )}
+
+          {messages.map((msg) => (
+            <div key={msg.id} className={`ai-message ${msg.role}`}>
+              <span className="message-avatar">
+                {msg.role === 'assistant' ? <Radar size={14} /> : '👤'}
+              </span>
+              <div>
+                <p className="ai-message-text">{formatAiContent(msg.content)}</p>
+                <span className="message-time">{fmtRelTime(new Date(msg.timestamp).toISOString())}</span>
+                {msg.linkedProduct && (
+                  <div className="ai-linked-product">
+                    <ProductArt kind={msg.linkedProduct.imageKind} size="sm" />
+                    <span>{msg.linkedProduct.name}</span>
+                  </div>
+                )}
+              </div>
+            </div>
+          ))}
+
+          {loading && (
+            <div className="ai-message assistant">
+              <span className="message-avatar"><Radar size={14} /></span>
+              <div className="ai-loading">
+                <span /><span /><span />
+              </div>
+            </div>
+          )}
+
+          {messages.length === 0 && (
+            <div className="prompt-chips">
+              {AI_QUICK_PROMPTS.map((p) => (
+                <button key={p} onClick={() => onPrompt(p)}>
+                  {p} <ArrowUpRight size={13} />
+                </button>
+              ))}
+            </div>
+          )}
+
+          <div ref={endRef} />
+        </div>
+
+        <form className="ai-input-wrap" onSubmit={onSubmit}>
+          <input
+            autoFocus
+            value={draft}
+            onChange={(e) => setDraft(e.target.value)}
+            placeholder="Ask anything about a product…"
+            aria-label="Ask the AI assistant"
+            disabled={loading}
+          />
+          <button type="submit" aria-label="Send" disabled={loading || !draft.trim()}>
+            <ArrowUpRight size={17} />
+          </button>
+        </form>
+
+        <p className="ai-disclaimer">
+          <ShieldCheck size={12} /> All recommendations use real connected offer data.
+          No prices are estimated or invented.
+        </p>
+      </section>
+    </div>
+  )
 }
 
-function HistoryView({ onSearch }: { onSearch: (query: string) => void }) {
-  const history = [
-    { query: 'Amul Taaza Milk 1L', detail: '6 offers · Today, 10:42 AM', product: catalog[0] },
-    { query: 'iPhone 16 128GB black', detail: '5 offers · Yesterday, 8:16 PM', product: catalog[1] },
-    { query: 'AirPods Pro 2', detail: '3 offers · Aug 28, 4:02 PM', product: catalog[2] },
-    { query: 'Head & Shoulders shampoo', detail: '4 offers · Aug 24, 11:28 AM', product: catalog[3] },
-  ]
-  return <div className="page-content utility-page"><div className="utility-page-head"><div><p className="eyebrow"><span className="eyebrow-spark"><History size={12} /></span> Pick up where you left off</p><h1>Search history</h1><p>Your recent comparisons, kept in one place.</p></div><button className="secondary-button" onClick={() => undefined}><TrashIcon /> Clear history</button></div><section className="history-list-card">{history.map((item, index) => <button className="history-row" key={item.query} onClick={() => onSearch(item.query)}><div className="history-number">0{index + 1}</div><div className="history-thumb"><ProductArt kind={item.product.imageKind} /></div><div className="history-query"><strong>{item.query}</strong><span>{item.detail}</span></div><div className="history-best"><span>Best total</span><strong>{formatRupees(Math.min(...item.product.offers.map((offer) => finalPrice(offer) ?? Infinity)))}</strong></div><ArrowRight size={17} /></button>)}</section></div>
+/** Basic markdown-lite formatter for AI messages */
+function formatAiContent(text: string): ReactNode {
+  return text.split('\n').map((line, i) => {
+    const parts = line.split(/(\*\*[^*]+\*\*)/)
+    return (
+      <span key={i}>
+        {parts.map((part, j) =>
+          part.startsWith('**') && part.endsWith('**')
+            ? <strong key={j}>{part.slice(2, -2)}</strong>
+            : part
+        )}
+        {i < text.split('\n').length - 1 && <br />}
+      </span>
+    )
+  })
 }
 
-function TrashIcon() {
-  return <span className="trash-symbol">⌫</span>
+// ─── Empty State ──────────────────────────────────────────────────────────────
+
+function EmptyState({
+  icon, title, description, action,
+}: { icon: ReactNode; title: string; description: string; action?: ReactNode }) {
+  return (
+    <div className="empty-state">
+      <div className="empty-icon">{icon}</div>
+      <h3>{title}</h3>
+      <p>{description}</p>
+      {action}
+    </div>
+  )
 }
 
-export default App
+
