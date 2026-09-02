@@ -629,7 +629,6 @@ function CompareView({
   onSelectOffer, isRefreshing,
 }: CompareViewProps) {
   const insight = priceInsight(product.priceHistory, product.priceHistory.points[product.priceHistory.points.length - 1]?.price ?? 0)
-  const disconnectedProviders = providers.filter((p) => !p.isConnected)
   const activeProviderIds = [...new Set(product.offers.filter((o) => mode === 'all' || o.mode === mode).map((o) => o.provider.id))]
 
   return (
@@ -946,16 +945,7 @@ function CompareView({
           </div>
         )}
 
-        {/* Disconnected providers notice */}
-        {disconnectedProviders.length > 0 && (
-          <div className="disconnected-notice">
-            <AlertCircle size={14} />
-            <span>
-              <strong>{disconnectedProviders.length} providers unavailable:</strong>{' '}
-              {disconnectedProviders.map((p) => p.name).join(', ')} — authorized feeds pending.
-            </span>
-          </div>
-        )}
+
 
         {/* Alternatives */}
         {product.alternatives && product.alternatives.length > 0 && (
@@ -1437,7 +1427,7 @@ function OverviewView({
         </div>
       </section>
 
-      {/* Connected providers */}
+      {/* Provider network — two clear groups */}
       <section>
         <div className="section-heading" style={{ marginBottom: 16 }}>
           <div>
@@ -1445,20 +1435,51 @@ function OverviewView({
             <h2>Provider network</h2>
           </div>
         </div>
+
+        {/* Active providers */}
+        <p className="pn-group-label">
+          <span className="pulse-dot" aria-hidden="true" />
+          Active — {providers.filter((p) => p.isConnected).length} providers connected
+        </p>
         <div className="provider-status-grid">
-          {providers.map((p) => (
-            <div key={p.id} className={`provider-status-card${p.isConnected ? ' connected' : ' disconnected'}`}>
+          {providers.filter((p) => p.isConnected).map((p) => (
+            <div key={p.id} className="provider-status-card connected">
               <div className="psc-mark" style={{ background: p.background, color: p.color }}>{p.mark}</div>
               <div className="psc-info">
                 <strong>{p.name}</strong>
-                <span>{p.kind}</span>
+                <span className="psc-kind">{p.kind}</span>
               </div>
-              <div className={`psc-status${p.isConnected ? ' ok' : ''}`}>
-                {p.isConnected ? <><Check size={12} /> Active</> : <><X size={12} /> Pending</>}
+              <div className="psc-status ok">
+                <Check size={12} /> Active
               </div>
             </div>
           ))}
         </div>
+
+        {/* Coming-soon providers */}
+        <p className="pn-group-label pn-group-label-soon" style={{ marginTop: 24 }}>
+          <span className="pn-soon-dot" aria-hidden="true" />
+          Coming soon — {providers.filter((p) => !p.isConnected).length} integrations in progress
+        </p>
+        <div className="provider-status-grid">
+          {providers.filter((p) => !p.isConnected).map((p) => (
+            <div key={p.id} className="provider-status-card coming-soon">
+              <div className="psc-mark psc-mark-soon">{p.mark}</div>
+              <div className="psc-info">
+                <strong>{p.name}</strong>
+                <span className="psc-kind">{p.kind}</span>
+              </div>
+              <div className="psc-status psc-status-soon">
+                Coming soon
+              </div>
+            </div>
+          ))}
+        </div>
+        <p className="pn-disclaimer">
+          <ShieldCheck size={12} />
+          PriceRadar only connects through official APIs, affiliate programmes, and provider-approved integrations.
+          New providers appear here as integrations are completed.
+        </p>
       </section>
     </div>
   )
