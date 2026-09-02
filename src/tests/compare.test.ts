@@ -1,223 +1,151 @@
 /**
- * Unit tests — price comparison engine
- * Run: npx vitest run
+ * Unit tests — comparison engine (real-data semantics)
+ * Unknown fees must stay unknown; unknown ETAs stay unknown; summaries use
+ * only comparable, actually-retrieved offers.
  */
 
 import { describe, expect, it } from 'vitest'
-import { buildFeeRows, discountPercent, feeTotal, finalPrice, formatRupees, priceInsight, sortOffers, summarize } from '../domain/compare'
-import type { Offer, PriceHistory, Provider } from '../domain/types'
+import {
+  buildSeries, collectedInsight, comparableOffers, describeFreshness,
+  discountPercent, feeTotal, finalPrice, formatMoney, offerFreshness,
+  priceLine, sortOffers, summarize, assertRealOffer,
+} from '../domain/compare'
+import { makeOffer } from './fixtures/records'
 
-// ─── Fixtures ─────────────────────────────────────────────────────────────────
-
-const provider: Provider = {
-  id: 'test', name: 'TestProvider', shortName: 'T', kind: 'instant',
-  mark: 'T', color: '#fff', background: '#000', isConnected: true,
-}
-
-function makeOffer(overrides: Partial<Offer> = {}): Offer {
-  return {
-    id: 'o1', provider, mode: 'instant',
-    productName: 'Test Product', brand: 'Brand', variant: 'V1', quantity: '1',
-    price: 100, mrp: 120,
-    fees: { delivery: 10, platform: 5, handling: 0, convenience: 0, other: 0 },
-    etaLabel: '15 min', etaMinutes: 15,
-    availability: 'in_stock', stockLabel: 'In stock',
-    seller: 'Seller', location: 'City',
-    match: 'exact', matchConfidence: 'Exact Match', matchScore: 0.99,
-    matchReason: 'All attributes match',
-    pricePerUnit: '₹100 / unit',
-    freshness: 'live', updatedSeconds: 10,
-    url: 'https://example.com',
-    isLiveData: false,
-    ...overrides,
-  }
-}
-
-// ─── feeTotal ─────────────────────────────────────────────────────────────────
-
-describe('feeTotal', () => {
-  it('sums all non-null fee fields', () => {
+describe('feeTotal / finalPrice', () => {
+  it('sums all disclosed fees', () => {
     const offer = makeOffer({ fees: { delivery: 10, platform: 5, handling: 2, convenience: 3, other: 1 } })
     expect(feeTotal(offer)).toBe(21)
+    expect(finalPrice(offer)).toBe(121)
   })
 
-  it('returns null when any fee is null', () => {
+  it('returns null when ANY fee is unknown — never assumes ₹0', () => {
     const offer = makeOffer({ fees: { delivery: null, platform: 5, handling: 0, convenience: 0, other: 0 } })
     expect(feeTotal(offer)).toBeNull()
-  })
-
-  it('returns 0 when all fees are 0', () => {
-    const offer = makeOffer({ fees: { delivery: 0, platform: 0, handling: 0, convenience: 0, other: 0 } })
-    expect(feeTotal(offer)).toBe(0)
-  })
-})
-
-// ─── finalPrice ───────────────────────────────────────────────────────────────
-
-describe('finalPrice', () => {
-  it('returns price + fees when all fees known', () => {
-    const offer = makeOffer({ price: 100, fees: { delivery: 10, platform: 5, handling: 0, convenience: 0, other: 0 } })
-    expect(finalPrice(offer)).toBe(115)
-  })
-
-  it('returns null when any fee is null', () => {
-    const offer = makeOffer({ fees: { delivery: null, platform: 5, handling: 0, convenience: 0, other: 0 } })
     expect(finalPrice(offer)).toBeNull()
   })
 
-  it('returns price when all fees are 0', () => {
-    const offer = makeOffer({ price: 250, fees: { delivery: 0, platform: 0, handling: 0, convenience: 0, other: 0 } })
-    expect(finalPrice(offer)).toBe(250)
+  it('renders unknown totals as “+ checkout charges”, not a number', () => {
+    const offer = makeOffer({ fees: { delivery: null, platform: null, handling: null, convenience: null, other: null } })
+    expect(priceLine(offer)).toBe('₹100 + checkout charges')
   })
 })
 
-// ─── discountPercent ──────────────────────────────────────────────────────────
-
-describe('discountPercent', () => {
-  it('calculates correct discount percentage', () => {
-    expect(discountPercent(makeOffer({ price: 80, mrp: 100 }))).toBe(20)
-  })
-
-  it('returns 0 when price equals MRP', () => {
-    expect(discountPercent(makeOffer({ price: 100, mrp: 100 }))).toBe(0)
-  })
-
-  it('returns 0 for zero MRP', () => {
-    expect(discountPercent(makeOffer({ price: 50, mrp: 0 }))).toBe(0)
-  })
-
-  it('rounds correctly', () => {
-    expect(discountPercent(makeOffer({ price: 67, mrp: 100 }))).toBe(33)
+describe('formatMoney', () => {
+  it('formats per currency and keeps unknown as At checkout', () => {
+    expect(formatMoney(100, 'INR')).toContain('100')
+    expect(formatMoney(3.21, 'EUR')).toContain('3,21')
+    expect(formatMoney(null)).toBe('At checkout')
   })
 })
 
-// ─── formatRupees ─────────────────────────────────────────────────────────────
-
-describe('formatRupees', () => {
-  it('formats in Indian locale', () => {
-    expect(formatRupees(1000)).toContain('1,000')
-  })
-
-  it('formats large numbers with correct grouping', () => {
-    expect(formatRupees(69499)).toContain('69,499')
-  })
-
-  it('returns "At checkout" for null', () => {
-    expect(formatRupees(null)).toBe('At checkout')
-  })
-
-  it('compact notation uses K/L suffix', () => {
-    const result = formatRupees(1000, true)
-    expect(result).toMatch(/K|k|thousand/i)
+describe('discount', () => {
+  it('computes discount only from a source-stated MRP', () => {
+    expect(discountPercent(makeOffer())).toBe(17) // 120 -> 100
+    expect(discountPercent(makeOffer({ mrp: null }))).toBeNull()
   })
 })
 
-// ─── sortOffers ───────────────────────────────────────────────────────────────
-
-describe('sortOffers', () => {
-  const cheap = makeOffer({ id: 'cheap', price: 50, fees: { delivery: 0, platform: 0, handling: 0, convenience: 0, other: 0 } })
-  const expensive = makeOffer({ id: 'expensive', price: 100, fees: { delivery: 0, platform: 0, handling: 0, convenience: 0, other: 0 } })
-  const fast = makeOffer({ id: 'fast', price: 80, etaMinutes: 5, fees: { delivery: 5, platform: 0, handling: 0, convenience: 0, other: 0 } })
-
-  it('sorts by price ascending', () => {
-    const sorted = sortOffers([expensive, cheap, fast], 'price')
-    expect(sorted[0].id).toBe('cheap')
+describe('comparableOffers / summarize', () => {
+  it('excludes reference points, out-of-stock and weak matches', () => {
+    const offers = [
+      makeOffer({ id: 'a', price: 100 }),
+      makeOffer({ id: 'b', price: 50, kind: 'reference' }),
+      makeOffer({ id: 'c', price: 60, availability: 'out_of_stock' }),
+      makeOffer({ id: 'd', price: 70, match: 'similar', matchConfidence: 'Possible Match' }),
+    ]
+    const ids = comparableOffers(offers).map((o) => o.id)
+    expect(ids).toEqual(['a'])
   })
 
-  it('sorts by speed (etaMinutes) ascending', () => {
-    const sorted = sortOffers([expensive, cheap, fast], 'speed')
-    expect(sorted[0].id).toBe('fast')
+  it('computes best price and savings from verified offers only', () => {
+    const offers = [
+      makeOffer({ id: 'a', price: 100 }),
+      makeOffer({ id: 'b', price: 150, sourceName: 'Second Source' }),
+    ]
+    const s = summarize(offers)
+    expect(s.bestPrice?.id).toBe('a')
+    expect(s.savings).toBe(50)
+    expect(s.nextBestPrice?.sourceName).toBe('Second Source')
   })
 
-  it('does not mutate the input array', () => {
-    const input = [expensive, cheap]
-    const sorted = sortOffers(input, 'price')
-    expect(input[0].id).toBe('expensive')
-    expect(sorted[0].id).toBe('cheap')
-  })
-
-  it('sorts by discount descending', () => {
-    const highDisc = makeOffer({ id: 'high-disc', price: 50, mrp: 100 })
-    const lowDisc  = makeOffer({ id: 'low-disc',  price: 90, mrp: 100 })
-    const sorted = sortOffers([lowDisc, highDisc], 'discount')
-    expect(sorted[0].id).toBe('high-disc')
-  })
-})
-
-// ─── summarize ────────────────────────────────────────────────────────────────
-
-describe('summarize', () => {
-  it('returns empty object for empty array', () => {
+  it('returns an empty summary (not a made-up winner) when nothing qualifies', () => {
+    expect(summarize([makeOffer({ availability: 'out_of_stock' })])).toEqual({})
     expect(summarize([])).toEqual({})
   })
 
-  it('identifies bestPrice correctly', () => {
-    const cheap = makeOffer({ id: 'cheap', price: 50, fees: { delivery: 0, platform: 0, handling: 0, convenience: 0, other: 0 } })
-    const pricey = makeOffer({ id: 'pricey', price: 100, fees: { delivery: 0, platform: 0, handling: 0, convenience: 0, other: 0 } })
-    expect(summarize([pricey, cheap]).bestPrice?.id).toBe('cheap')
-  })
-
-  it('excludes unavailable offers', () => {
-    const unavail = makeOffer({ id: 'unavail', price: 1, availability: 'unavailable' })
-    const instock = makeOffer({ id: 'instock', price: 50, fees: { delivery: 0, platform: 0, handling: 0, convenience: 0, other: 0 } })
-    expect(summarize([unavail, instock]).bestPrice?.id).toBe('instock')
-  })
-
-  it('identifies fastest correctly', () => {
-    const fast = makeOffer({ id: 'fast', etaMinutes: 8 })
-    const slow = makeOffer({ id: 'slow', etaMinutes: 40 })
-    expect(summarize([slow, fast]).fastest?.id).toBe('fast')
+  it('fastest is undefined when no source supplied an ETA', () => {
+    const s = summarize([makeOffer({ etaMinutes: null, deliveryNote: null })])
+    expect(s.fastest).toBeUndefined()
   })
 })
 
-// ─── buildFeeRows ─────────────────────────────────────────────────────────────
-
-describe('buildFeeRows', () => {
-  it('includes product price as first row', () => {
-    const rows = buildFeeRows(makeOffer({ price: 100 }))
-    expect(rows[0]).toEqual(['Product price', 100])
-  })
-
-  it('includes a discount row when mrp > price', () => {
-    const rows = buildFeeRows(makeOffer({ price: 80, mrp: 100 }))
-    const discRow = rows.find(([label]) => label === 'Discount')
-    expect(discRow).toBeDefined()
-    expect(discRow![1]).toBe(-20)
-  })
-
-  it('only includes fee rows with positive values', () => {
-    const offer = makeOffer({
-      price: 100, mrp: 100,
-      fees: { delivery: 10, platform: 0, handling: 0, convenience: 0, other: 0 },
-    })
-    const rows = buildFeeRows(offer)
-    const labels = rows.map(([l]) => l)
-    expect(labels).toContain('Delivery fee')
-    expect(labels).not.toContain('Platform fee')
+describe('sortOffers', () => {
+  it('sorts by final price and pushes unknown totals last', () => {
+    const offers = [
+      makeOffer({ id: 'unknown', price: 10, fees: { delivery: null, platform: null, handling: null, convenience: null, other: null } }),
+      makeOffer({ id: 'cheap', price: 100, fees: { delivery: 0, platform: 0, handling: 0, convenience: 0, other: 0 } }),
+      makeOffer({ id: 'mid', price: 100, fees: { delivery: 20, platform: 0, handling: 0, convenience: 0, other: 0 } }),
+    ]
+    expect(sortOffers(offers, 'price').map((o) => o.id)).toEqual(['cheap', 'mid', 'unknown'])
   })
 })
 
-// ─── priceInsight ─────────────────────────────────────────────────────────────
+describe('freshness labels', () => {
+  it('live within a minute, updated within 15, cached is labeled cached', () => {
+    expect(describeFreshness(Date.now() - 5_000).label).toMatch(/^Live · updated \d+s ago$/)
+    expect(describeFreshness(Date.now() - 5 * 60_000).label).toMatch(/^Updated \d+ min ago$/)
+    const cached = describeFreshness(Date.now() - 60_000, true)
+    expect(cached.label).toMatch(/^Cached · retrieved/)
+    expect(cached.cls).toBe('cached')
+    expect(offerFreshness(makeOffer({ freshness: 'cached', retrievedAt: Date.now() - 60_000 })).cls).toBe('cached')
+  })
 
-describe('priceInsight', () => {
-  const history: PriceHistory = {
-    points: [{ date: '2025-08-01', price: 100 }],
-    lowest: 80, highest: 120, average: 100,
-    change: 0, changePercent: 0, trend: 'flat', period: 'last 30 days',
+  it('old data is labeled stale, never presented as live', () => {
+    expect(describeFreshness(Date.now() - 2 * 3_600_000).cls).toBe('stale')
+  })
+})
+
+describe('provenance guard (assertRealOffer)', () => {
+  it('accepts a fully provenance-carrying offer', () => {
+    expect(() => assertRealOffer(makeOffer())).not.toThrow()
+  })
+
+  it('rejects offers without retrievedAt / source / currency', () => {
+    expect(() => assertRealOffer(makeOffer({ retrievedAt: 0 }))).toThrow(/retrievedAt/)
+    expect(() => assertRealOffer(makeOffer({ sourceId: '' }))).toThrow(/sourceId/)
+    expect(() => assertRealOffer(makeOffer({ currency: '' }))).toThrow(/currency/)
+    expect(() => assertRealOffer(makeOffer({ price: 0 }))).toThrow(/price/)
+  })
+
+  it('rejects shoppable offers with invalid product URLs', () => {
+    expect(() => assertRealOffer(makeOffer({ productUrl: 'not-a-url' }))).toThrow(/productUrl/)
+  })
+})
+
+describe('collected history', () => {
+  const base = {
+    productId: 'off:1', productKey: 'gtin:1', productName: 'P',
+    sourceId: 's', merchant: null, currency: 'INR',
   }
+  it('needs two distinct observation dates before a trend exists', () => {
+    const single = buildSeries([{ ...base, price: 10, retrievedAt: 1, observedAt: '2026-01-01' }], 'INR')
+    expect(single.enough).toBe(false)
+    expect(collectedInsight([single.points[0]], 'INR')).toBeNull()
 
-  it('reports when price is below average', () => {
-    const insight = priceInsight({ ...history, average: 100 }, 85)
-    expect(insight).toContain('below')
+    const two = buildSeries([
+      { ...base, price: 10, retrievedAt: 1, observedAt: '2026-01-01' },
+      { ...base, price: 12, retrievedAt: 2, observedAt: '2026-02-01' },
+    ], 'INR')
+    expect(two.enough).toBe(true)
+    expect(collectedInsight(two.points, 'INR')).toMatch(/up/)
   })
 
-  it('reports when price is above average', () => {
-    const insight = priceInsight({ ...history, average: 100 }, 115)
-    expect(insight).toContain('above')
-  })
-
-  it('reports near average', () => {
-    const insight = priceInsight({ ...history, average: 100 }, 100)
-    expect(insight).toContain('near')
+  it('separates currencies — never mixes EUR points into an INR series', () => {
+    const pts = [
+      { ...base, price: 10, retrievedAt: 1, observedAt: '2026-01-01' },
+      { ...base, price: 12, retrievedAt: 2, observedAt: '2026-02-01', currency: 'EUR' },
+    ]
+    expect(buildSeries(pts, 'INR').enough).toBe(false)
   })
 })

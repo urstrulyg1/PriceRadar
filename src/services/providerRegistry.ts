@@ -1,162 +1,155 @@
-import type { DeliveryMode, Offer, Provider, ProviderAdapter, ProviderHealth } from '../domain/types'
+// ─── Provider registry ────────────────────────────────────────────────────────
+// Queries every configured source concurrently, isolates failures, and
+// reports an honest per-source status. A provider that fails, times out,
+// lacks credentials, or has no authorized integration yields ZERO offers —
+// the UI shows the reason, never a substitute value.
 
-export type ProviderStatus = 'connected' | 'temporarily_unavailable' | 'not_serviceable'
+import type {
+  Offer, OfferAdapter, ProviderResult, ProviderStatus, SearchContext,
+} from '../domain/types'
+import { ProviderUnavailableError } from '../domain/types'
 
-export interface ProviderResult {
-  provider: Provider
-  status: ProviderStatus
-  offers: Offer[]
-  latencyMs: number
-  error?: string
-}
+const FAILURE_THRESHOLD = 3
+const RECOVERY_WINDOW_MS = 60_000
+const DEFAULT_TIMEOUT_MS = 10_000
 
-/**
- * ProviderRegistry isolates provider failures from the UI and comparison engine.
- *
- * - All providers are queried concurrently via Promise.allSettled().
- * - A single provider timeout/error never breaks the comparison.
- * - Results are annotated with provider status so the UI can show
- *   "Provider X is temporarily unavailable" without crashing.
- *
- * Circuit-breaker state: after FAILURE_THRESHOLD consecutive failures the
- * provider is placed in 'temporarily_unavailable' without being queried.
- * It is re-tried after RECOVERY_WINDOW_MS.
- */
 export class ProviderRegistry {
-  private static readonly FAILURE_THRESHOLD = 3
-  private static readonly RECOVERY_WINDOW_MS = 60_000 // 1 minute
-  private static readonly DEFAULT_TIMEOUT_MS = 8_000  // 8 seconds per provider
-
-  private readonly adapters = new Map<string, ProviderAdapter>()
+  private readonly adapters = new Map<string, OfferAdapter>()
   private readonly failures = new Map<string, number>()
-  private readonly lastFailureTime = new Map<string, number>()
-  private readonly latencyHistory = new Map<string, number[]>()
+  private readonly lastFailureAt = new Map<string, number>()
 
-  register(adapter: ProviderAdapter): void {
-    this.adapters.set(adapter.provider.id, adapter)
+  register(adapter: OfferAdapter): void {
+    this.adapters.set(adapter.id, adapter)
   }
 
-  unregister(providerId: string): void {
-    this.adapters.delete(providerId)
-    this.failures.delete(providerId)
-    this.lastFailureTime.delete(providerId)
+  registerAll(adapters: OfferAdapter[]): void {
+    adapters.forEach((a) => this.register(a))
   }
 
-  list(mode?: DeliveryMode): Provider[] {
+  unregister(id: string): void {
+    this.adapters.delete(id)
+    this.failures.delete(id)
+    this.lastFailureAt.delete(id)
+  }
+
+  list(): OfferAdapter[] {
     return [...this.adapters.values()]
-      .filter((a) => !mode || a.supportedModes.includes(mode))
-      .map((a) => a.provider)
   }
 
-  /** Health snapshot for all registered providers */
-  health(): ProviderHealth[] {
-    return [...this.adapters.values()].map((a) => {
-      const failCount = this.failures.get(a.provider.id) ?? 0
-      const lastFail = this.lastFailureTime.get(a.provider.id) ?? 0
-      const inCooldown = failCount >= ProviderRegistry.FAILURE_THRESHOLD &&
-        Date.now() - lastFail < ProviderRegistry.RECOVERY_WINDOW_MS
-      const latencies = this.latencyHistory.get(a.provider.id) ?? []
-      const avgLatency = latencies.length
-        ? Math.round(latencies.reduce((s, l) => s + l, 0) / latencies.length)
-        : undefined
-      return {
-        provider: a.provider,
-        status: inCooldown ? 'temporarily_unavailable' : 'connected',
-        latencyMs: avgLatency,
-        lastChecked: lastFail || Date.now(),
-        error: inCooldown ? `${failCount} consecutive failures` : undefined,
-      } satisfies ProviderHealth
-    })
+  /** Static status before any query: pending / needs auth / ready. */
+  idleStatus(adapter: OfferAdapter): ProviderStatus {
+    if (adapter.staticStatus) return adapter.staticStatus
+    if (adapter.requiresAuth()) return 'auth_required'
+    return 'connected'
   }
 
-  private isCircuitOpen(providerId: string): boolean {
-    const fails = this.failures.get(providerId) ?? 0
-    if (fails < ProviderRegistry.FAILURE_THRESHOLD) return false
-    const last = this.lastFailureTime.get(providerId) ?? 0
-    return Date.now() - last < ProviderRegistry.RECOVERY_WINDOW_MS
+  private circuitOpen(id: string): boolean {
+    const fails = this.failures.get(id) ?? 0
+    if (fails < FAILURE_THRESHOLD) return false
+    const last = this.lastFailureAt.get(id) ?? 0
+    return Date.now() - last < RECOVERY_WINDOW_MS
   }
 
-  private recordSuccess(providerId: string): void {
-    this.failures.set(providerId, 0)
+  private recordSuccess(id: string): void {
+    this.failures.set(id, 0)
   }
 
-  private recordFailure(providerId: string): void {
-    this.failures.set(providerId, (this.failures.get(providerId) ?? 0) + 1)
-    this.lastFailureTime.set(providerId, Date.now())
-  }
-
-  private recordLatency(providerId: string, ms: number): void {
-    const history = this.latencyHistory.get(providerId) ?? []
-    history.push(ms)
-    if (history.length > 20) history.shift()
-    this.latencyHistory.set(providerId, history)
+  private recordFailure(id: string): void {
+    this.failures.set(id, (this.failures.get(id) ?? 0) + 1)
+    this.lastFailureAt.set(id, Date.now())
   }
 
   /**
-   * Query all matching adapters concurrently with timeouts.
-   * Never throws — partial results are always returned.
+   * Query all adapters. Never throws; always returns a result per adapter
+   * with an honest status and zero offers on any failure.
    */
-  async compare(query: string, location: string, mode?: DeliveryMode): Promise<ProviderResult[]> {
-    const adapters = [...this.adapters.values()].filter(
-      (a) => !mode || a.supportedModes.includes(mode)
+  async compare(ctx: SearchContext): Promise<ProviderResult[]> {
+    const adapters = this.list()
+
+    const settled = await Promise.all(
+      adapters.map((adapter): Promise<ProviderResult> => this.queryOne(adapter, ctx)),
     )
+    return settled
+  }
 
-    const results = await Promise.allSettled(
-      adapters.map(async (adapter): Promise<ProviderResult> => {
-        const id = adapter.provider.id
+  private async queryOne(adapter: OfferAdapter, ctx: SearchContext): Promise<ProviderResult> {
+    const retrievedAt = Date.now()
 
-        // Circuit breaker check
-        if (this.isCircuitOpen(id)) {
-          return {
-            provider: adapter.provider,
-            status: 'temporarily_unavailable',
-            offers: [],
-            latencyMs: 0,
-            error: 'Circuit open — provider temporarily suspended after repeated failures',
-          }
-        }
-
-        const start = Date.now()
-        try {
-          const offers = await Promise.race([
-            adapter.search(query, location),
-            new Promise<never>((_, reject) =>
-              setTimeout(() => reject(new Error('Provider timeout')), ProviderRegistry.DEFAULT_TIMEOUT_MS)
-            ),
-          ])
-          const latencyMs = Date.now() - start
-          this.recordSuccess(id)
-          this.recordLatency(id, latencyMs)
-          return { provider: adapter.provider, status: 'connected', offers, latencyMs }
-        } catch (err) {
-          const latencyMs = Date.now() - start
-          this.recordFailure(id)
-          this.recordLatency(id, latencyMs)
-          const error = err instanceof Error ? err.message : 'Unknown provider error'
-          console.error(`[ProviderRegistry] ${id} failed: ${error}`)
-          return { provider: adapter.provider, status: 'temporarily_unavailable', offers: [], latencyMs, error }
-        }
-      })
-    )
-
-    return results.map((r, i) => {
-      if (r.status === 'fulfilled') return r.value
-      // Promise.allSettled should never reject since we catch inside, but handle defensively
+    if (this.circuitOpen(adapter.id)) {
       return {
-        provider: adapters[i].provider,
-        status: 'temporarily_unavailable' as const,
+        sourceId: adapter.id,
+        sourceName: adapter.name,
+        status: 'temporarily_unavailable',
         offers: [],
-        latencyMs: 0,
-        error: 'Unexpected registry error',
+        latencyMs: null,
+        retrievedAt,
+        error: 'Paused after repeated failures — will retry automatically',
       }
-    })
+    }
+
+    if (adapter.requiresAuth()) {
+      return {
+        sourceId: adapter.id,
+        sourceName: adapter.name,
+        status: 'auth_required',
+        offers: [],
+        latencyMs: null,
+        retrievedAt,
+        note: adapter.accessNote,
+      }
+    }
+
+    const start = Date.now()
+    try {
+      const offers = await Promise.race([
+        adapter.search(ctx),
+        new Promise<never>((_, reject) =>
+          setTimeout(() => reject(new ProviderUnavailableError('temporarily_unavailable', 'Source timed out')), DEFAULT_TIMEOUT_MS),
+        ),
+      ])
+      const latencyMs = Date.now() - start
+      this.recordSuccess(adapter.id)
+      return {
+        sourceId: adapter.id,
+        sourceName: adapter.name,
+        status: 'live',
+        offers,
+        latencyMs,
+        retrievedAt,
+      }
+    } catch (err) {
+      this.recordFailure(adapter.id)
+      const latencyMs = Date.now() - start
+      if (err instanceof ProviderUnavailableError) {
+        // `connected` + note = a deliberate skip (source not applicable to
+        // this query), which is not a failure.
+        if (err.status === 'connected') this.recordSuccess(adapter.id)
+        return {
+          sourceId: adapter.id,
+          sourceName: adapter.name,
+          status: err.status,
+          offers: [],
+          latencyMs,
+          retrievedAt,
+          note: err.status === 'connected' ? err.message : undefined,
+          error: err.status === 'connected' ? undefined : err.message,
+        }
+      }
+      return {
+        sourceId: adapter.id,
+        sourceName: adapter.name,
+        status: 'error',
+        offers: [],
+        latencyMs,
+        retrievedAt,
+        error: err instanceof Error ? err.message : 'Unknown source failure',
+      }
+    }
   }
 }
 
-export const globalRegistry = new ProviderRegistry()
-
-export function createRegistry(adapters: ProviderAdapter[] = []): ProviderRegistry {
+export function createRegistry(adapters: OfferAdapter[] = []): ProviderRegistry {
   const registry = new ProviderRegistry()
-  adapters.forEach((a) => registry.register(a))
+  registry.registerAll(adapters)
   return registry
 }
