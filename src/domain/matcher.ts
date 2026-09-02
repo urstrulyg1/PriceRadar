@@ -1,4 +1,4 @@
-import type { MatchConfidence, MatchLevel } from './types'
+import type { MatchConfidence, MatchLevel, Offer, ProductIdentity } from './types'
 
 // ─── Normalized product identity ──────────────────────────────────────────────
 // Two products are the same only when strong identifiers agree, or when a
@@ -166,4 +166,58 @@ export function matchProduct(ref: ProductAttributes, cand: ProductAttributes): M
     score: 0.55,
     reason: 'Name or category is similar but key attributes differ',
   }
+}
+
+// ─── Attribute extraction from real records ───────────────────────────────────
+
+/** Pull matchable attributes out of a resolved real product identity. */
+export function attributesFromIdentity(identity: ProductIdentity): ProductAttributes {
+  return {
+    brand: identity.brand,
+    name: identity.name,
+    gtin: identity.barcode,
+    size: identity.quantity,
+    quantity: identity.quantity,
+  }
+}
+
+const SIZE_RE = /\b(\d+(?:\.\d+)?)\s?(ml|l|litre|liter|g|kg|gm|gram|grams|pcs|pieces|pack|pk)\b/i
+
+/**
+ * Extract matchable attributes from a real listing title.
+ * Only tokens actually present in the source title are used — nothing is
+ * inferred or invented.
+ */
+export function attributesFromTitle(title: string, extra: { brand?: string | null; barcode?: string | null; color?: string | null; size?: string | null; model?: string | null } = {}): ProductAttributes {
+  const attrs: ProductAttributes = {
+    name: title,
+    gtin: extra.barcode ?? undefined,
+    brand: extra.brand ?? undefined,
+    color: extra.color ?? undefined,
+    size: extra.size ?? undefined,
+    model: extra.model ?? undefined,
+  }
+  const sizeMatch = title.match(SIZE_RE)
+  if (sizeMatch && !attrs.size) {
+    attrs.size = `${sizeMatch[1]} ${sizeMatch[2].toLowerCase()}`
+  }
+  return attrs
+}
+
+/**
+ * Verify a retrieved listing against the resolved identity. When no identity
+ * was resolved (barcode-less query), listings from a barcode-keyed lookup are
+ * still exact (the barcode IS the identifier); text-search listings can never
+ * be better than “likely”.
+ */
+export function matchOfferToIdentity(offer: Offer, identity: ProductIdentity | null, lookupByBarcode: boolean): MatchResult {
+  if (identity) {
+    return matchProduct(
+      attributesFromIdentity(identity),
+      attributesFromTitle(offer.productName, { brand: offer.brand, barcode: offer.barcode }),
+    )
+  }
+  return lookupByBarcode
+    ? { level: 'exact', confidence: 'Exact Match', score: 0.95, reason: 'Listing resolved by product barcode' }
+    : { level: 'likely', confidence: 'High Confidence', score: 0.75, reason: 'Text-search result — verify variant before buying' }
 }

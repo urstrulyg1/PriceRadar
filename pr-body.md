@@ -1,102 +1,51 @@
-## Summary
+# PriceRadar — Real Data Only / Zero Dummy Data
 
-This PR delivers a complete audit-first upgrade of PriceRadar, transforming it from a polished prototype into a substantially more powerful, accurate, and production-ready AI price comparison platform.
+## What this PR does
 
----
+Converts PriceRadar from a UI prototype backed by a static catalog of invented products into a **real-data-only price comparison platform**. If a source cannot return real data, the app shows an honest unavailable state — it never fabricates prices, ETAs, stock, offers, ratings, history, or AI answers.
 
-## What was audited and found
+## Removed (all fabricated data paths)
 
-| Area | Original state |
-|---|---|
-| Demo products | 4 hardcoded |
-| Price history | 8 static numbers — no dates, no real chart possible |
-| AI assistant | Only called `findProduct()` — no response text, no grounding |
-| Alerts view | Static placeholder with hardcoded product names |
-| Wishlist view | Showed `catalog` directly, no real state |
-| History view | 4 hardcoded entries, no real timestamps |
-| Overview view | Nav item existed — view was **not implemented** |
-| `FeeBreakdown` | Missing `convenience` fee field |
-| `MatchConfidence` | Typed but never populated in offers |
-| Tests | **Zero** |
+- Deleted `src/data/catalog.ts` — 726 lines of invented products, offers, fees, price history, and a fake-grounded AI responder
+- Removed seeded price alerts / wishlist / search history (all user records now start empty and are created only from real actions)
+- Removed fake "All sources live" pill, fake source-health widget, fake refresh simulation, and demo persona
+- Removed tests asserting the static catalog
 
----
+## Real integrations (verified API shapes)
 
-## Architecture changes
+| Source | Access | Ships as |
+|---|---|---|
+| Open Food Facts | public open DB, keyless | Live — real product identity (barcode, brand, quantity, image) |
+| Open Prices | public open dataset, keyless | Live — real community-recorded price points with store + date |
+| UPCitemDB | public trial API, keyless | Live — real merchant listings keyed by barcode |
+| Google Shopping (SerpApi) | authorized, key-gated | `Authentication required` until a key is configured in-app |
+| Flipkart Affiliate feed | authorized, credential-gated | `Authentication required` until configured in-app |
+| 17 instant-delivery / e-commerce stores (Blinkit, Zepto, Instamart, Amazon.in PA-API, Myntra, …) | no authorized API exists | `Integration pending` — return nothing, never simulated |
 
-- **`domain/types.ts`** — Added `convenience` fee, `PricePoint[]` with ISO dates, `TrendDirection`, `MatchConfidence`, `AiMessage`, `PriceAlert`, `WishlistItem`, `SearchHistoryEntry`, `AlternativeProduct`, `isLiveData` flag on every offer
-- **`domain/compare.ts`** — `buildFeeRows()` for transparent breakdown, `priceInsight()`, `priceVsAverage()`, discount and rating sort modes, `summarize()` considers exact + likely matches
-- **`domain/matcher.ts`** — Conflict detection for GTIN/SKU/model/color/storage/connector; name similarity alone can never produce an exact match
-- **`services/providerRegistry.ts`** — Circuit breaker (3-failure threshold, 60 s recovery), per-provider 8 s timeouts, latency history, `health()` snapshot
-- **`data/catalog.ts`** — 6 demo products (was 4), 30-day `PricePoint[]` history, `parseQuery()`, `generateAiResponse()` grounded in real offer data
+All upstream calls go through same-origin `/api/*` routes (Vite dev proxy in development, zero-dependency `gateway/server.mjs` in production, with optional server-side key injection via env vars). No CORS or anti-bot bypassing.
 
----
+## Integrity mechanics added
 
-## New features
+- **Provenance on every offer** (`sourceId`, `merchant`, `productUrl`, `retrievedAt`, `observedAt`, `currency`) with a runtime `assertRealOffer` guard
+- **Freshness labels**: `Live · updated 18s ago` / `Cached · retrieved 12 min ago` / `Stale` — cached results are re-labeled and never shown as live (90 s TTL)
+- **Unknown stays unknown**: undisclosed fees → “₹X + checkout charges”; no ETA → “Delivery estimate unavailable”; no stock info → “Unknown”
+- **Exact-variant matching**: GTIN/model/size/colour/storage conflicts downgrade or reject a match; name similarity alone can't produce “exact”
+- **Earned price history**: chart only from observations PriceRadar actually recorded; < 2 dated points → “Not enough historical data yet.”
+- **Grounded AI**: deterministic assistant over cited retrieval records (source · price · checked-when), with the exact “I couldn't find verified live pricing…” reply when there is no data
+- **Provider status system**: live / connected / auth required / integration pending / temporarily unavailable / error, per source, on every search
+- **Beautiful empty states** with Try again / Change location / Search another product actions; partial results are first-class
 
-- AI shopping assistant with conversation history, loading states, grounded responses (real prices, real providers — no hallucinations)
-- Interactive 30-day price history chart (recharts AreaChart + reference lines)
-- Mini sparkline in product overview card
-- Price alerts — create, delete, manage; live badge count
-- Real wishlist with add/remove state
-- Search history with timestamps and best-total tracking
-- Overview dashboard — stats, product grid, provider network (two groups: Active / Coming soon)
-- Transparent fee breakdown: product + discount + delivery + platform + handling + convenience + other
-- Filter panel — price range, in-stock toggle, provider multi-select
-- Sort options — best overall / lowest price / fastest / biggest discount / highest rated
-- Summary cards — Best Price / Fastest / Best Overall (clickable)
-- Smart alternatives section — clearly labelled as different products
-- Empty states for every view
-- Toast notification system — success / info / error
+## Guard tests (71 passing)
 
----
+- production source scan: no fabrication vocabulary, no static catalog, no fixture imports, no literal product prices
+- unauthenticated sources return zero offers without being queried; failures/rate-limits surface as unavailable; pending stores return nothing
+- unknown fees/ETA/availability remain unknown end-to-end
+- cached data carries freshness metadata; AI replies cite only offers that exist and quote no amounts without data
+- app smoke tests: zero preloaded shopping data, honest pre-search state, pending stores listed transparently
+- fixtures isolated under `src/tests/fixtures/` (clearly marked, never imported by production code)
 
-## UI/UX
+## Validation
 
-- Full CSS design-token system (`--r-sm/md/lg/xl`, `--tx`, shadow tokens)
-- Offer cards: provider colour bar, freshness badge, fee rows, ETA badge, stock status, rating, match badge, offer-label tag
-- Keyboard accessibility: Escape closes all modals and panels
-- ARIA: `role="dialog"`, `aria-modal`, `aria-label`, `role="tablist"`, `aria-selected`, `aria-current`
-- Focus-visible styles for keyboard users
-- Dark mode — all new components use CSS variables
-- Responsive — breakpoints at 1100 / 900 / 600 / 420 px
-- Mobile: slide-in sidebar, bottom-anchored AI panel, stacked layouts
-
----
-
-## Provider network
-
-Disconnected providers are now shown as a deliberate **Coming soon** group in the Overview — dashed-border cards, greyscale marks, pill badge. The raw "X providers unavailable — authorized feeds pending" banner that appeared on every search result has been removed.
-
-| Connected (10) | Coming soon (8) |
-|---|---|
-| Blinkit, Zepto, Swiggy Instamart, BB Now | Flipkart Minutes, Amazon Now, DMart Ready |
-| Amazon, Flipkart, Croma, Reliance Digital, BigBasket, Tata CLiQ | Myntra, Nykaa, Vijay Sales, Meesho, AJIO |
-
----
-
-## Testing
-
-**72 unit tests — all passing** (`npm test`)
-
-| File | Tests |
-|---|---|
-| `compare.test.ts` | 28 — feeTotal, finalPrice, discountPercent, formatRupees, sortOffers, summarize, buildFeeRows, priceInsight |
-| `matcher.test.ts` | 11 — exact / likely / similar / not-a-match, conflict detection, edge cases |
-| `catalog.test.ts` | 25 — catalog integrity, findProduct, parseQuery, generateAiResponse |
-| `providerRegistry.test.ts` | 8 — concurrent aggregation, failure isolation, circuit breaker, health, mode filtering |
-
----
-
-## Performance
-
-- Vite manual chunks: `react-vendor`, `charts`, `icons` — app JS is 89 KB (gzip 23 KB)
-- All providers queried concurrently with individual timeouts and circuit-breaker protection
-
----
-
-## Remaining limitations (honest)
-
-- No live provider data — real integration requires official affiliate/partner programmes
-- No backend/database — state resets on page reload
-- AI responses are rule-based, not LLM-powered
-- Price alerts do not send push/email notifications (no background worker)
+- `npm test` → 71/71 passing
+- `tsc -b` clean, `vite build` succeeds
+- Repo-wide audit for mock/dummy/fake/sample/demo/placeholder/hardcoded tokens: production code clean

@@ -1,315 +1,293 @@
 import {
   useCallback, useEffect, useMemo, useRef, useState,
-  type CSSProperties, type FormEvent, type KeyboardEvent, type ReactNode,
+  type FormEvent, type ReactNode,
 } from 'react'
 import {
-  AlertCircle, ArrowDownRight, ArrowLeft, ArrowRight, ArrowUpRight,
-  Bell, BellRing, Check, ChevronDown, ChevronRight, ChevronUp,
-  CircleHelp, Clock3, Copy, ExternalLink, Eye, Filter, Gift,
-  Globe2, Heart, History, Info, LayoutDashboard, ListFilter,
-  MapPin, Menu, Minus, Moon, MoreHorizontal, PackageCheck,
-  PanelLeftClose, Plus, RefreshCw, Radar, Search, Settings2,
-  Share2, ShieldCheck, ShoppingBag, Sparkles, Star, Sun, Tag,
-  TrendingDown, TrendingUp, Truck, Users, WalletCards, X, Zap,
+  AlertCircle, ArrowUpRight, BadgeCheck, Bell, BellRing, Check,
+  ChevronDown, ChevronRight, Clock3, Database, ExternalLink, Globe2,
+  Heart, History, Info, KeyRound, LayoutDashboard, Lock, MapPin,
+  Menu, Moon, PackageOpen, Radar, RefreshCw, ScanBarcode, Search,
+  Settings2, ShieldCheck, Sparkles, Sunrise, TrendingUp, Truck, X,
 } from 'lucide-react'
 import {
-  Area, AreaChart, CartesianGrid, ReferenceLine,
-  ResponsiveContainer, Tooltip, XAxis, YAxis,
+  Area, AreaChart, CartesianGrid, ResponsiveContainer, Tooltip, XAxis, YAxis,
 } from 'recharts'
-import {
-  catalog, defaultProduct, findProduct, generateAiResponse,
-  parseQuery, providers,
-} from './data/catalog'
-import {
-  buildFeeRows, discountPercent, finalPrice, formatRupees,
-  matchLevelToConfidence, priceInsight, sortOffers, summarize,
-} from './domain/compare'
 import type {
-  AiMessage, DeliveryMode, MatchLevel, Offer, PriceAlert,
-  Product, SearchHistoryEntry, WishlistItem,
+  AiMessage, Offer, PriceAlert, ProductIdentity, ProviderResult,
+  ProviderStatus, SearchResult, SearchHistoryEntry, WishlistItem,
 } from './domain/types'
+import {
+  buildFeeRows, buildSeries, collectedInsight, comparableOffers,
+  describeFreshness, discountPercent, finalPrice, formatMoney,
+  offerFreshness, priceLine, sortOffers, summarize,
+} from './domain/compare'
+import { ProviderRegistry } from './services/providerRegistry'
+import { createSearchService } from './services/search'
+import { answer as assistantAnswer } from './services/assistant'
+import { providerConfig, CREDENTIAL_SPECS } from './services/providerConfig'
+import {
+  allCollectedPoints, getCollectedPoints, onHistoryChange, productKeyOf,
+} from './services/priceHistoryStore'
+import { PENDING_STORES } from './services/adapters/pendingProviders'
 
-// ─── Local types ──────────────────────────────────────────────────────────────
-type Mode = DeliveryMode | 'all'
-type ViewId = 'compare' | 'overview' | 'alerts' | 'wishlist' | 'history'
-type SortKey = 'overall' | 'price' | 'speed' | 'discount' | 'rating'
-type FilterState = {
-  priceMin: string; priceMax: string;
-  providers: string[];
-  availability: boolean; exactOnly: boolean;
-}
+// ─── Local helpers ────────────────────────────────────────────────────────────
 
-// ─── Constants ────────────────────────────────────────────────────────────────
+type ViewId = 'compare' | 'sources' | 'alerts' | 'wishlist' | 'history'
+type SortKey = 'overall' | 'price' | 'speed' | 'match'
+
+const uid = () => Math.random().toString(36).slice(2)
+
 const NAV_ITEMS: Array<{ id: ViewId; label: string; icon: typeof Radar }> = [
-  { id: 'compare',  label: 'Compare prices',  icon: Radar },
-  { id: 'overview', label: 'Overview',         icon: LayoutDashboard },
-  { id: 'alerts',   label: 'Price alerts',     icon: BellRing },
-  { id: 'wishlist', label: 'Wishlist',         icon: Heart },
-  { id: 'history',  label: 'Search history',  icon: History },
+  { id: 'compare',  label: 'Compare prices', icon: Radar },
+  { id: 'sources',  label: 'Data sources',   icon: Database },
+  { id: 'alerts',   label: 'Price alerts',   icon: BellRing },
+  { id: 'wishlist', label: 'Wishlist',       icon: Heart },
+  { id: 'history',  label: 'Search history', icon: History },
 ]
 
 const SORT_OPTIONS: Array<{ value: SortKey; label: string }> = [
-  { value: 'overall',  label: 'Best overall' },
-  { value: 'price',    label: 'Lowest price' },
-  { value: 'speed',    label: 'Fastest delivery' },
-  { value: 'discount', label: 'Biggest discount' },
-  { value: 'rating',   label: 'Highest rated' },
+  { value: 'overall', label: 'Best overall' },
+  { value: 'price',   label: 'Lowest price' },
+  { value: 'speed',   label: 'Fastest delivery' },
+  { value: 'match',   label: 'Match confidence' },
 ]
 
-const LOCATIONS = [
-  'Koramangala, Bengaluru',
-  'Indiranagar, Bengaluru',
-  'HSR Layout, Bengaluru',
-  'Whitefield, Bengaluru',
-  'Bandra, Mumbai',
-]
-
-const SEARCH_SUGGESTIONS = [
-  { label: 'iPhone 16 128GB black', hint: 'Mobiles' },
-  { label: 'AirPods Pro 2',          hint: 'Audio' },
-  { label: 'cheapest shampoo near me', hint: 'Personal care' },
-  { label: 'basmati rice 5kg',        hint: 'Groceries' },
-  { label: 'detergent under ₹300',   hint: 'Household' },
+// Search affordances — these are queries, not data. Nothing here is a product
+// record, price, or result; every search runs against live sources.
+const SEARCH_HINTS = [
+  { label: 'nutella', hint: 'try a grocery brand' },
+  { label: 'amul taaza milk', hint: 'or any packaged food' },
+  { label: '3017620422003', hint: 'or paste a barcode' },
 ]
 
 const AI_QUICK_PROMPTS = [
-  'Find the cheapest iPhone 16 near me',
-  'Detergent under ₹300 delivered in 30 min',
+  'What’s the cheapest verified price?',
   'Is this a good price right now?',
-  'Best shampoo under ₹500',
+  'Which source is unavailable?',
 ]
 
-const INITIAL_ALERTS: PriceAlert[] = [
-  { id: 'a1', productId: 'amul-taaza-1l',         productName: 'Amul Taaza Milk 1L',                targetPrice: 55,    currentBest: 67,    status: 'active',    createdAt: '2025-08-28' },
-  { id: 'a2', productId: 'iphone-16-128-black',   productName: 'iPhone 16 128GB Black',              targetPrice: 68000, currentBest: 69499, status: 'active',    createdAt: '2025-08-25' },
-  { id: 'a3', productId: 'airpods-pro-2-usbc',    productName: 'AirPods Pro 2 USB-C',               targetPrice: 17500, currentBest: 18499, status: 'active',    createdAt: '2025-08-20' },
-]
+const registry = new ProviderRegistry()
+const searchService = createSearchService(registry)
 
-const INITIAL_WISHLIST: WishlistItem[] = catalog.map((p) => ({ productId: p.id, addedAt: '2025-08-15' }))
-
-const INITIAL_HISTORY: SearchHistoryEntry[] = [
-  { query: 'Amul Taaza Milk 1L',        productId: 'amul-taaza-1l',          timestamp: '2025-09-02T10:42:00', offerCount: 6, bestTotal: 67 },
-  { query: 'iPhone 16 128GB black',     productId: 'iphone-16-128-black',    timestamp: '2025-09-01T20:16:00', offerCount: 5, bestTotal: 69499 },
-  { query: 'AirPods Pro 2',             productId: 'airpods-pro-2-usbc',     timestamp: '2025-08-28T16:02:00', offerCount: 3, bestTotal: 18499 },
-  { query: 'Head & Shoulders shampoo',  productId: 'head-shoulders-650',     timestamp: '2025-08-24T11:28:00', offerCount: 5, bestTotal: 400 },
-  { query: 'basmati rice 5kg',          productId: 'india-gate-basmati-5kg', timestamp: '2025-08-22T09:10:00', offerCount: 4, bestTotal: 453 },
-]
-
-// ─── Utility ──────────────────────────────────────────────────────────────────
-const uid = () => Math.random().toString(36).slice(2)
-
-function fmtRelTime(ts: string): string {
-  const diff = Date.now() - new Date(ts).getTime()
-  const m = Math.floor(diff / 60000)
-  if (m < 60) return `${m}m ago`
-  const h = Math.floor(m / 60)
-  if (h < 24) return `${h}h ago`
-  return `${Math.floor(h / 24)}d ago`
+const STATUS_META: Record<ProviderStatus, { label: string; cls: string }> = {
+  live: { label: 'Live', cls: 'ok' },
+  connected: { label: 'Connected', cls: 'ok' },
+  auth_required: { label: 'Authentication required', cls: 'warn' },
+  integration_pending: { label: 'Integration pending', cls: 'muted' },
+  temporarily_unavailable: { label: 'Temporarily unavailable', cls: 'err' },
+  error: { label: 'Error', cls: 'err' },
 }
 
-function fmtDate(iso: string): string {
-  return new Date(iso).toLocaleDateString('en-IN', { day: 'numeric', month: 'short' })
+function useLocalState<T>(key: string, initial: T): [T, (v: T | ((p: T) => T)) => void] {
+  const [value, setValue] = useState<T>(() => {
+    try {
+      const raw = localStorage.getItem(key)
+      return raw ? JSON.parse(raw) as T : initial
+    } catch {
+      return initial
+    }
+  })
+  useEffect(() => {
+    try {
+      localStorage.setItem(key, JSON.stringify(value))
+    } catch {
+      // non-fatal: state stays in memory
+    }
+  }, [key, value])
+  return [value, setValue]
 }
 
 // ─── App ──────────────────────────────────────────────────────────────────────
 
 export default function App() {
-  // Views
   const [activeView, setActiveView] = useState<ViewId>('compare')
+  const [sidebarOpen, setSidebarOpen] = useState(false)
+  const [darkMode, setDarkMode] = useLocalState('priceradar.dark', false)
 
   // Search
-  const [query, setQuery] = useState('Amul Taaza Milk 1L')
-  const [product, setProduct] = useState<Product>(defaultProduct)
-  const [searchOpen, setSearchOpen] = useState(false)
-  const searchRef = useRef<HTMLInputElement>(null)
+  const [query, setQuery] = useState('')
+  const [search, setSearch] = useState<SearchResult | null>(null)
+  const [searching, setSearching] = useState(false)
+  const [searchFailed, setSearchFailed] = useState<string | null>(null)
+  const searchInputRef = useRef<HTMLInputElement>(null)
 
-  // Mode & filters
-  const [mode, setMode] = useState<Mode>('instant')
+  // Compare controls
   const [sort, setSort] = useState<SortKey>('overall')
-  const [filters, setFilters] = useState<FilterState>({
-    priceMin: '', priceMax: '', providers: [], availability: false, exactOnly: true,
-  })
-  const [showFilters, setShowFilters] = useState(false)
+  const [listingTab, setListingTab] = useState<'shoppable' | 'reference'>('shoppable')
 
-  // UI state
-  const [location, setLocation] = useState(LOCATIONS[0])
+  // Location (used only by sources that support it)
+  const [location, setLocation] = useLocalState<string | null>('priceradar.location', null)
+  const [locationDraft, setLocationDraft] = useState('')
   const [locationOpen, setLocationOpen] = useState(false)
-  const [sidebarOpen, setSidebarOpen] = useState(false)
-  const [darkMode, setDarkMode] = useState(false)
-  const [isRefreshing, setIsRefreshing] = useState(false)
-  const [selectedOffer, setSelectedOffer] = useState<Offer | null>(null)
-  const [alertOpen, setAlertOpen] = useState(false)
-  const [alertPrice, setAlertPrice] = useState('')
 
-  // Toast
+  // Persisted, user-generated-only records
+  const [alerts, setAlerts] = useLocalState<PriceAlert[]>('priceradar.alerts.v1', [])
+  const [wishlist, setWishlist] = useLocalState<WishlistItem[]>('priceradar.wishlist.v1', [])
+  const [history, setHistory] = useLocalState<SearchHistoryEntry[]>('priceradar.history.v1', [])
+  const [, forceHistoryTick] = useState(0)
+
+  // UI
   const [toast, setToast] = useState<{ msg: string; type?: 'success' | 'info' | 'error' } | null>(null)
+  const [selectedOffer, setSelectedOffer] = useState<Offer | null>(null)
+  const [alertFor, setAlertFor] = useState<ProductIdentity | null>(null)
+  const [alertPrice, setAlertPrice] = useState('')
 
   // AI
   const [aiOpen, setAiOpen] = useState(false)
   const [aiMessages, setAiMessages] = useState<AiMessage[]>([])
   const [aiDraft, setAiDraft] = useState('')
-  const [aiLoading, setAiLoading] = useState(false)
+  const [aiThinking, setAiThinking] = useState(false)
   const aiEndRef = useRef<HTMLDivElement>(null)
 
-  // Alerts & wishlist
-  const [alerts, setAlerts] = useState<PriceAlert[]>(INITIAL_ALERTS)
-  const [wishlist, setWishlist] = useState<WishlistItem[]>(INITIAL_WISHLIST)
-  const [history, setHistory] = useState<SearchHistoryEntry[]>(INITIAL_HISTORY)
-  const [providerFilter, setProviderFilter] = useState('all')
-
-  // ── Derived state ───────────────────────────────────────────────────────────
-
-  const isSaved = wishlist.some((w) => w.productId === product.id)
-
-  const modeOffers = useMemo(() => {
-    let offers = product.offers.filter((o) => mode === 'all' || o.mode === mode)
-    if (providerFilter !== 'all') offers = offers.filter((o) => o.provider.id === providerFilter)
-    return offers
-  }, [mode, product, providerFilter])
-
-  const filteredOffers = useMemo(() => {
-    let offers = modeOffers
-    if (filters.exactOnly) offers = offers.filter((o) => o.match === 'exact' || o.match === 'likely')
-    if (filters.availability) offers = offers.filter((o) => o.availability === 'in_stock')
-    if (filters.priceMin) offers = offers.filter((o) => (finalPrice(o) ?? 0) >= Number(filters.priceMin))
-    if (filters.priceMax) offers = offers.filter((o) => (finalPrice(o) ?? Infinity) <= Number(filters.priceMax))
-    if (filters.providers.length) offers = offers.filter((o) => filters.providers.includes(o.provider.id))
-    return sortOffers(offers, sort)
-  }, [modeOffers, filters, sort])
-
-  const summary = useMemo(() => summarize(filteredOffers), [filteredOffers])
-
-  const instantCount = product.offers.filter((o) => o.mode === 'instant').length
-  const normalCount  = product.offers.filter((o) => o.mode === 'normal').length
-  const connectedCount = providers.filter((p) => p.isConnected).length
-
-  // ── Effects ─────────────────────────────────────────────────────────────────
-
+  useEffect(() => onHistoryChange(() => forceHistoryTick((t) => t + 1)), [])
   useEffect(() => {
     if (!toast) return
-    const t = setTimeout(() => setToast(null), 3400)
+    const t = setTimeout(() => setToast(null), 3600)
     return () => clearTimeout(t)
   }, [toast])
-
   useEffect(() => {
     document.documentElement.classList.toggle('dark', darkMode)
   }, [darkMode])
-
   useEffect(() => {
     aiEndRef.current?.scrollIntoView({ behavior: 'smooth' })
-  }, [aiMessages, aiLoading])
-
-  // ── Actions ─────────────────────────────────────────────────────────────────
+  }, [aiMessages, aiThinking])
+  useEffect(() => providerConfig.onChange(() => forceHistoryTick((t) => t + 1)), [])
 
   const showToast = (msg: string, type: 'success' | 'info' | 'error' = 'info') => setToast({ msg, type })
 
-  const runSearch = useCallback((q: string) => {
-    const nextProduct = findProduct(q)
-    setQuery(q)
-    setProduct(nextProduct)
+  // ── Search (real retrieval only) ────────────────────────────────────────────
+
+  const runSearch = useCallback(async (rawQuery: string, opts: { force?: boolean } = {}) => {
+    const q = rawQuery.trim()
+    if (!q) return
+    setSearching(true)
+    setSearchFailed(null)
     setActiveView('compare')
-    setProviderFilter('all')
-    setSearchOpen(false)
-    setMode(nextProduct.offers.some((o) => o.mode === 'instant') ? 'instant' : 'normal')
-    // Add to history
-    const fp = Math.min(...nextProduct.offers.map((o) => finalPrice(o) ?? Infinity))
-    setHistory((prev) => [
-      { query: q, productId: nextProduct.id, timestamp: new Date().toISOString(), offerCount: nextProduct.offers.length, bestTotal: isFinite(fp) ? fp : undefined },
-      ...prev.filter((h) => h.query !== q),
-    ].slice(0, 20))
-    showToast(`Comparing ${nextProduct.name}`, 'success')
-  }, [])
+    try {
+      const result = await searchService.run(q, location, opts)
+      setSearch(result)
+      setListingTab(result.offers.some((o) => o.kind === 'shoppable') ? 'shoppable' : 'reference')
+      const shoppable = comparableOffers(result.offers).length
+      setHistory((prev) => [
+        {
+          query: q,
+          timestamp: new Date().toISOString(),
+          offerCount: shoppable,
+          identityName: result.identity?.name,
+        },
+        ...prev.filter((h) => h.query.toLowerCase() !== q.toLowerCase()),
+      ].slice(0, 20))
+      const live = result.results.filter((r) => r.offers.length > 0).length
+      showToast(
+        shoppable
+          ? `${shoppable} verified offer(s) from ${live} live source(s)`
+          : live > 0
+            ? `${live} source(s) responded — no verified offers for this query`
+            : 'No source returned data — see status for reasons',
+        shoppable ? 'success' : 'info',
+      )
+    } catch (err) {
+      setSearch(null)
+      setSearchFailed(err instanceof Error ? err.message : 'Search failed')
+      showToast('Search failed — no data was fabricated to fill the page', 'error')
+    } finally {
+      setSearching(false)
+    }
+  }, [location, setHistory])
 
   const handleSearch = (e: FormEvent<HTMLFormElement>) => {
     e.preventDefault()
     if (query.trim()) runSearch(query.trim())
   }
 
-  const chooseLocation = (loc: string) => {
-    setLocation(loc)
-    setLocationOpen(false)
-    showToast(`Showing availability around ${loc.split(',')[0]}`, 'info')
+  const refresh = () => {
+    if (search?.query) runSearch(search.query, { force: true })
+    else showToast('Run a search first — refresh re-queries live sources', 'info')
   }
 
-  const refreshOffers = () => {
-    setIsRefreshing(true)
-    setTimeout(() => {
-      setIsRefreshing(false)
-      showToast('All connected sources refreshed', 'success')
-    }, 1100)
-  }
-
-  const shareComparison = async () => {
-    try {
-      await navigator.clipboard.writeText(window.location.href)
-      showToast('Comparison link copied', 'success')
-    } catch {
-      showToast('Share link ready', 'info')
-    }
-  }
-
-  const toggleWishlist = () => {
-    if (isSaved) {
-      setWishlist((w) => w.filter((i) => i.productId !== product.id))
+  const toggleWishlist = (identity: ProductIdentity) => {
+    const key = productKeyOf(identity)
+    if (wishlist.some((w) => productKeyOf(w.identity) === key)) {
+      setWishlist((w) => w.filter((i) => productKeyOf(i.identity) !== key))
       showToast('Removed from wishlist', 'info')
     } else {
-      setWishlist((w) => [...w, { productId: product.id, addedAt: new Date().toISOString() }])
+      setWishlist((w) => [...w, { identity, addedAt: new Date().toISOString() }])
       showToast('Saved to wishlist', 'success')
     }
   }
 
-  const saveAlert = (price: number) => {
-    const existing = alerts.findIndex((a) => a.productId === product.id)
-    const best = Math.min(...product.offers.map((o) => finalPrice(o) ?? Infinity))
-    const newAlert: PriceAlert = {
-      id: uid(), productId: product.id, productName: product.name,
-      targetPrice: price, currentBest: isFinite(best) ? best : 0,
-      status: 'active', createdAt: new Date().toISOString(),
+  const saveAlert = (identity: ProductIdentity, price: number) => {
+    const best = search && search.identity && productKeyOf(search.identity) === productKeyOf(identity)
+      ? summarize(search.offers).bestPrice
+      : undefined
+    const alert: PriceAlert = {
+      id: uid(),
+      productKey: productKeyOf(identity),
+      productName: identity.name,
+      targetPrice: price,
+      currency: best?.currency ?? 'INR',
+      currentBest: best ? (finalPrice(best) ?? best.price) : null,
+      currentBestSource: best?.sourceName ?? null,
+      status: 'active',
+      createdAt: new Date().toISOString(),
     }
-    if (existing >= 0) {
-      setAlerts((a) => a.map((item, i) => i === existing ? newAlert : item))
-    } else {
-      setAlerts((a) => [newAlert, ...a])
-    }
-    setAlertOpen(false)
-    showToast(`Alert set — we'll notify you when ${product.name} drops below ₹${price.toLocaleString('en-IN')}`, 'success')
+    setAlerts((a) => [alert, ...a.filter((x) => x.productKey !== alert.productKey)])
+    setAlertFor(null)
+    showToast(
+      best
+        ? `Alert set — we’ll flag ${identity.name} below ${formatMoney(price, alert.currency)} (current verified best: ${formatMoney(alert.currentBest, alert.currency)})`
+        : `Alert set — no verified price exists yet, so it will start checking on your next searches`,
+      'success',
+    )
   }
+
+  // ── AI ──────────────────────────────────────────────────────────────────────
 
   const submitAiPrompt = async (e: FormEvent<HTMLFormElement>) => {
     e.preventDefault()
-    if (!aiDraft.trim() || aiLoading) return
-    const userMsg: AiMessage = { id: uid(), role: 'user', content: aiDraft.trim(), timestamp: Date.now() }
-    setAiMessages((m) => [...m, userMsg])
+    const text = aiDraft.trim()
+    if (!text || aiThinking) return
+    setAiMessages((m) => [...m, { id: uid(), role: 'user', content: text, timestamp: Date.now() }])
     setAiDraft('')
-    setAiLoading(true)
-    // Simulate network latency while building grounded response
-    await new Promise((r) => setTimeout(r, 750 + Math.random() * 500))
-    const { response, product: linkedProduct } = generateAiResponse(userMsg.content, product)
-    const assistantMsg: AiMessage = {
-      id: uid(), role: 'assistant', content: response,
-      timestamp: Date.now(), linkedProduct,
-    }
-    setAiMessages((m) => [...m, assistantMsg])
-    setAiLoading(false)
-    // If AI found a different product, navigate to it
-    if (linkedProduct.id !== product.id) {
-      runSearch(linkedProduct.searchTerms[0])
-    }
+    setAiThinking(true)
+    await new Promise((r) => setTimeout(r, 350)) // let the UI settle; no data is generated
+    const reply = assistantAnswer(text, { result: search })
+    setAiMessages((m) => [...m, {
+      id: uid(),
+      role: 'assistant',
+      content: reply.content,
+      timestamp: Date.now(),
+      citations: reply.citations,
+    }])
+    setAiThinking(false)
   }
 
-  const useAiPrompt = (prompt: string) => {
-    setAiDraft(prompt)
-  }
+  // ── Derived ─────────────────────────────────────────────────────────────────
 
-  const changeView = (view: ViewId) => {
-    setActiveView(view)
+  const identity = search?.identity ?? null
+  const isSaved = identity ? wishlist.some((w) => productKeyOf(w.identity) === productKeyOf(identity)) : false
+
+  const offersForTab = useMemo(() => {
+    if (!search) return []
+    const pool = search.offers.filter((o) => o.kind === listingTab)
+    return sortOffers(pool, sort === 'match' ? 'overall' : sort)
+  }, [search, listingTab, sort])
+
+  const summary = useMemo(() => (search ? summarize(search.offers) : {}), [search])
+  const collected = useMemo(
+    () => (identity ? getCollectedPoints(productKeyOf(identity)) : []),
+    [identity, search, history, allCollectedPoints().length],
+  )
+  const collectedCurrency = summary.bestPrice?.currency ?? collected[0]?.currency ?? 'INR'
+
+  const liveCount = search?.results.filter((r) => r.offers.length > 0).length ?? 0
+  const authCount = search?.results.filter((r) => r.status === 'auth_required').length
+    ?? registry.list().filter((a) => a.requiresAuth()).length
+  const pendingCount = PENDING_STORES.length
+
+  const changeView = (v: ViewId) => {
+    setActiveView(v)
     setSidebarOpen(false)
-  }
-
-  const openAlertFor = (p: Product) => {
-    const best = Math.min(...p.offers.map((o) => finalPrice(o) ?? Infinity))
-    setAlertPrice(isFinite(best) ? String(Math.round(best * 0.9)) : '')
-    setAlertOpen(true)
   }
 
   // ── Render ──────────────────────────────────────────────────────────────────
@@ -324,15 +302,15 @@ export default function App() {
             <span className="brand-name">Price<span>Radar</span></span>
           </div>
           <button className="icon-button sidebar-close" aria-label="Close navigation" onClick={() => setSidebarOpen(false)}>
-            <PanelLeftClose size={18} />
+            <X size={18} />
           </button>
         </div>
 
-        <button className="sidebar-location" onClick={() => setLocationOpen(true)} aria-label="Change location">
+        <button className="sidebar-location" onClick={() => setLocationOpen(true)} aria-label="Set delivery area">
           <span className="sidebar-location-icon"><MapPin size={14} /></span>
           <span className="sidebar-location-text">
-            <span>Shopping around</span>
-            <strong>{location.split(',')[0]}</strong>
+            <span>Delivery area</span>
+            <strong>{location ?? 'Not set'}</strong>
           </span>
           <ChevronRight size={15} />
         </button>
@@ -340,8 +318,7 @@ export default function App() {
         <nav aria-label="Workspace navigation">
           <p className="side-label">Workspace</p>
           {NAV_ITEMS.map(({ id, label, icon: Icon }) => {
-            const badge = id === 'alerts' ? alerts.filter((a) => a.status === 'active').length
-              : id === 'wishlist' ? wishlist.length : 0
+            const badge = id === 'alerts' ? alerts.length : id === 'wishlist' ? wishlist.length : 0
             return (
               <button
                 key={id}
@@ -359,30 +336,26 @@ export default function App() {
 
         <div className="sidebar-spacer" />
 
-        {/* Provider health */}
-        <div className="source-health">
+        <div className="source-health" aria-live="polite">
           <div className="health-topline">
-            <span className="pulse-dot" aria-hidden="true" />
-            <span>Source health</span>
-            <MoreHorizontal size={15} />
+            <span className={`pulse-dot${liveCount ? '' : ' off'}`} aria-hidden="true" />
+            <span>Source status</span>
+            <Database size={15} />
           </div>
-          <strong>All systems normal</strong>
-          <p><span>{connectedCount}</span> providers active</p>
-          <div className="health-bars" aria-hidden="true">
-            {[7, 13, 10, 8, 17, 9, 12, 8, 11, 7].map((h, i) => (
-              <i key={i} style={{ height: `${h}px`, background: i === 4 ? 'var(--lime)' : '#58a980' }} />
-            ))}
-          </div>
-          <button onClick={() => showToast('Provider management is coming in the next release', 'info')}>
+          <strong>{liveCount ? `${liveCount} source${liveCount > 1 ? 's' : ''} returned data` : 'No live query yet'}</strong>
+          <p>
+            <span>{authCount}</span> need your key · <span>{pendingCount}</span> pending integration
+          </p>
+          <button onClick={() => changeView('sources')}>
             Manage sources <ArrowUpRight size={13} />
           </button>
         </div>
 
         <div className="sidebar-user">
-          <div className="user-avatar" aria-hidden="true">AK</div>
+          <div className="user-avatar" aria-hidden="true"><ShieldCheck size={16} /></div>
           <div className="user-copy">
-            <strong>Arjun Kapoor</strong>
-            <span>Personal account</span>
+            <strong>Local workspace</strong>
+            <span>Your keys &amp; history stay on this device</span>
           </div>
           <Settings2 size={16} />
         </div>
@@ -394,196 +367,196 @@ export default function App() {
 
       {/* ── Main ── */}
       <main className="main-content">
-
-        {/* ── Topbar ── */}
         <header className="topbar">
           <button className="icon-button mobile-menu" aria-label="Open navigation" onClick={() => setSidebarOpen(true)}>
             <Menu size={21} />
           </button>
 
           <div className="topbar-location-wrap">
-            <button className="topbar-location" onClick={() => setLocationOpen((v) => !v)} aria-expanded={locationOpen}>
+            <button className="topbar-location" onClick={() => setLocationOpen(true)}>
               <span className="location-pin"><MapPin size={15} fill="currentColor" /></span>
               <span>
-                <small>Deliver to</small>
-                <strong>{location}</strong>
+                <small>Area</small>
+                <strong>{location ?? 'Set delivery area'}</strong>
               </span>
               <ChevronDown size={15} />
             </button>
-
-            {locationOpen && (
-              <div className="location-menu" role="dialog" aria-label="Choose location">
-                <div className="location-menu-header">
-                  <span>Your locations</span>
-                  <button onClick={() => setLocationOpen(false)} aria-label="Close"><X size={14} /></button>
-                </div>
-                {LOCATIONS.map((loc) => (
-                  <button
-                    key={loc}
-                    className={loc === location ? 'selected' : ''}
-                    onClick={() => chooseLocation(loc)}
-                  >
-                    <MapPin size={14} />
-                    {loc}
-                    {loc === location && <Check size={14} />}
-                  </button>
-                ))}
-                <button className="add-location" onClick={() => showToast('Manual pincode entry coming soon', 'info')}>
-                  <Plus size={14} /> Add location or pincode
-                </button>
-              </div>
-            )}
           </div>
 
           <div className="topbar-actions">
-            <div className="live-source-pill" aria-label="All sources live">
-              <span className="pulse-dot" aria-hidden="true" />
-              All sources live
+            <div className={`live-source-pill${liveCount ? '' : ' none'}`} title="Sources that returned real data on the last search">
+              <span className={`pulse-dot${liveCount ? '' : ' off'}`} aria-hidden="true" />
+              {liveCount ? `${liveCount} live` : 'No live sources'}
             </div>
 
-            <button
-              className="ask-ai-button"
-              onClick={() => setAiOpen(true)}
-              aria-label="Open AI shopping assistant"
-            >
+            <button className="ask-ai-button" onClick={() => setAiOpen(true)} aria-label="Open AI shopping assistant">
               <Sparkles size={14} />
               Ask AI
             </button>
 
             <button
-              className={`icon-button refresh-button${isRefreshing ? ' refreshing' : ''}`}
-              onClick={refreshOffers}
-              aria-label="Refresh all prices"
-              title="Refresh prices"
+              className={`icon-button refresh-button${searching ? ' refreshing' : ''}`}
+              onClick={refresh}
+              aria-label="Re-query all sources"
+              title="Re-query live sources"
+              disabled={searching}
             >
               <RefreshCw size={17} />
             </button>
 
-            <button
-              className="icon-button"
-              onClick={() => setDarkMode((d) => !d)}
-              aria-label={darkMode ? 'Switch to light mode' : 'Switch to dark mode'}
-            >
-              {darkMode ? <Sun size={18} /> : <Moon size={18} />}
+            <button className="icon-button" onClick={() => setDarkMode((d) => !d)} aria-label="Toggle dark mode">
+              {darkMode ? <Sunrise size={18} /> : <Moon size={18} />}
             </button>
-
-            <div className="topbar-avatar" aria-hidden="true">AK</div>
           </div>
         </header>
 
-        {/* ── Views ── */}
         {activeView === 'compare' && (
           <CompareView
             query={query}
             setQuery={setQuery}
-            product={product}
-            mode={mode}
-            setMode={setMode}
-            sort={sort}
-            setSort={setSort}
-            filters={filters}
-            setFilters={setFilters}
-            showFilters={showFilters}
-            setShowFilters={setShowFilters}
-            providerFilter={providerFilter}
-            setProviderFilter={setProviderFilter}
-            filteredOffers={filteredOffers}
-            summary={summary}
-            instantCount={instantCount}
-            normalCount={normalCount}
-            isSaved={isSaved}
-            searchOpen={searchOpen}
-            setSearchOpen={setSearchOpen}
-            searchRef={searchRef}
+            searchInputRef={searchInputRef}
             onSearch={handleSearch}
             onRun={runSearch}
-            onRefresh={refreshOffers}
-            onShare={shareComparison}
+            searching={searching}
+            searchFailed={searchFailed}
+            search={search}
+            listingTab={listingTab}
+            setListingTab={setListingTab}
+            sort={sort}
+            setSort={setSort}
+            offersForTab={offersForTab}
+            summary={summary}
+            collected={collected}
+            collectedCurrency={collectedCurrency}
+            identity={identity}
+            isSaved={isSaved}
             onWishlist={toggleWishlist}
-            onSetAlert={() => {
-              const best = Math.min(...product.offers.map((o) => finalPrice(o) ?? Infinity))
-              setAlertPrice(isFinite(best) ? String(Math.round(best * 0.9)) : '')
-              setAlertOpen(true)
-            }}
+            onAlert={setAlertFor}
             onSelectOffer={setSelectedOffer}
-            isRefreshing={isRefreshing}
+            onOpenLocation={() => setLocationOpen(true)}
+            collectedCount={allCollectedPoints().length}
           />
         )}
 
-        {activeView === 'overview' && (
-          <OverviewView
-            catalog={catalog}
-            alerts={alerts}
-            wishlist={wishlist}
-            onProduct={(p) => { setProduct(p); setQuery(p.name); setActiveView('compare'); setMode(p.offers.some((o) => o.mode === 'instant') ? 'instant' : 'normal') }}
-            onSetAlert={openAlertFor}
+        {activeView === 'sources' && (
+          <SourcesView
+            lastResult={search}
+            registry={registry}
+            onToast={showToast}
           />
         )}
 
         {activeView === 'alerts' && (
           <AlertsView
             alerts={alerts}
-            catalog={catalog}
             onDelete={(id) => { setAlerts((a) => a.filter((x) => x.id !== id)); showToast('Alert deleted', 'info') }}
-            onAdd={() => { setProduct(defaultProduct); setActiveView('compare') }}
-            onCompare={(productId) => {
-              const p = catalog.find((c) => c.id === productId)
-              if (p) { setProduct(p); setQuery(p.name); setActiveView('compare') }
-            }}
+            onGoCompare={() => changeView('compare')}
           />
         )}
 
         {activeView === 'wishlist' && (
           <WishlistView
             wishlist={wishlist}
-            catalog={catalog}
-            onProduct={(p) => { setProduct(p); setQuery(p.name); setActiveView('compare') }}
-            onRemove={(id) => { setWishlist((w) => w.filter((i) => i.productId !== id)); showToast('Removed from wishlist', 'info') }}
+            onSearch={(q) => runSearch(q)}
+            onRemove={(key) => {
+              setWishlist((w) => w.filter((i) => productKeyOf(i.identity) !== key))
+              showToast('Removed from wishlist', 'info')
+            }}
           />
         )}
 
         {activeView === 'history' && (
           <HistoryView
             history={history}
-            catalog={catalog}
             onSearch={(q) => runSearch(q)}
             onClear={() => { setHistory([]); showToast('Search history cleared', 'info') }}
           />
         )}
       </main>
 
-      {/* ── Modals ── */}
+      {/* ── Location dialog ── */}
+      {locationOpen && (
+        <div className="modal-backdrop" role="dialog" aria-modal="true" aria-label="Set delivery area" onMouseDown={(e) => { if (e.target === e.currentTarget) setLocationOpen(false) }}>
+          <div className="modal-body location-modal">
+            <div className="modal-kicker"><MapPin size={14} /> Delivery area</div>
+            <h3>Where are you shopping from?</h3>
+            <p className="modal-disclaimer">
+              The area is passed to sources that support location-based results. None of the currently
+              integrated instant-delivery services expose an authorized API yet, so no instant
+              serviceability claims are made.
+            </p>
+            <form
+              className="config-form"
+              onSubmit={(e) => {
+                e.preventDefault()
+                setLocation(locationDraft.trim() || null)
+                setLocationOpen(false)
+                showToast(locationDraft.trim() ? `Delivery area set to ${locationDraft.trim()}` : 'Delivery area cleared', 'info')
+              }}
+            >
+              <input
+                value={locationDraft}
+                onChange={(e) => setLocationDraft(e.target.value)}
+                placeholder="City, area or pincode"
+                aria-label="Delivery area"
+                autoFocus
+              />
+              <button type="button" className="secondary-button" onClick={() => setLocationDraft('')}>
+                Clear
+              </button>
+              <button type="submit" className="primary-button">Save area</button>
+            </form>
+          </div>
+        </div>
+      )}
+
+      {/* ── Offer modal ── */}
       {selectedOffer && (
-        <OfferModal
-          offer={selectedOffer}
-          onClose={() => setSelectedOffer(null)}
-        />
+        <OfferModal offer={selectedOffer} onClose={() => setSelectedOffer(null)} />
       )}
 
-      {alertOpen && (
-        <AlertModal
-          product={product}
-          price={alertPrice}
-          setPrice={setAlertPrice}
-          existingAlert={alerts.find((a) => a.productId === product.id)}
-          onClose={() => setAlertOpen(false)}
-          onSave={() => {
-            const p = Number(alertPrice)
-            if (p > 0) saveAlert(p)
-          }}
-        />
+      {/* ── Alert modal ── */}
+      {alertFor && (
+        <div className="modal-backdrop" role="dialog" aria-modal="true" onMouseDown={(e) => { if (e.target === e.currentTarget) setAlertFor(null) }}>
+          <div className="modal-body">
+            <div className="modal-kicker"><Bell size={14} /> Price alert</div>
+            <h3>{alertFor.name}</h3>
+            <p className="modal-disclaimer">
+              Alerts are checked against verified prices PriceRadar retrieves on your future searches.
+              {summary.bestPrice
+                ? ` Current verified best: ${formatMoney(finalPrice(summary.bestPrice) ?? summary.bestPrice.price, summary.bestPrice.currency)} at ${summary.bestPrice.sourceName}.`
+                : ' No verified price exists for this product yet.'}
+            </p>
+            <form className="config-form" onSubmit={(e) => {
+              e.preventDefault()
+              const v = Number(alertPrice)
+              if (v > 0) saveAlert(alertFor, v)
+            }}>
+              <input
+                value={alertPrice}
+                onChange={(e) => setAlertPrice(e.target.value)}
+                inputMode="numeric"
+                placeholder={`Target price (${collectedCurrency})`}
+                aria-label="Target price"
+                autoFocus
+              />
+              <button type="submit" className="primary-button">Set alert</button>
+            </form>
+          </div>
+        </div>
       )}
 
+      {/* ── AI panel ── */}
       {aiOpen && (
         <AiPanel
           messages={aiMessages}
           draft={aiDraft}
           setDraft={setAiDraft}
-          loading={aiLoading}
+          thinking={aiThinking}
           endRef={aiEndRef}
           onClose={() => setAiOpen(false)}
           onSubmit={submitAiPrompt}
-          onPrompt={useAiPrompt}
+          hasSearch={!!search}
         />
       )}
 
@@ -591,7 +564,7 @@ export default function App() {
       {toast && (
         <div className={`toast toast-${toast.type ?? 'info'}`} role="status" aria-live="polite">
           {toast.type === 'success' && <Check size={15} />}
-          {toast.type === 'error'   && <AlertCircle size={15} />}
+          {toast.type === 'error' && <AlertCircle size={15} />}
           {(!toast.type || toast.type === 'info') && <Info size={15} />}
           {toast.msg}
         </div>
@@ -600,1390 +573,1035 @@ export default function App() {
   )
 }
 
-// ─── Compare View ─────────────────────────────────────────────────────────────
+// ─── Compare view ─────────────────────────────────────────────────────────────
 
 interface CompareViewProps {
-  query: string; setQuery: (q: string) => void
-  product: Product; mode: Mode; setMode: (m: Mode) => void
-  sort: SortKey; setSort: (s: SortKey) => void
-  filters: FilterState; setFilters: (f: FilterState) => void
-  showFilters: boolean; setShowFilters: (v: boolean) => void
-  providerFilter: string; setProviderFilter: (v: string) => void
-  filteredOffers: Offer[]; summary: ReturnType<typeof summarize>
-  instantCount: number; normalCount: number
-  isSaved: boolean; searchOpen: boolean; setSearchOpen: (v: boolean) => void
-  searchRef: React.RefObject<HTMLInputElement>
+  query: string
+  setQuery: (q: string) => void
+  searchInputRef: React.RefObject<HTMLInputElement>
   onSearch: (e: FormEvent<HTMLFormElement>) => void
-  onRun: (q: string) => void; onRefresh: () => void; onShare: () => void
-  onWishlist: () => void; onSetAlert: () => void
-  onSelectOffer: (o: Offer) => void; isRefreshing: boolean
+  onRun: (q: string) => void
+  searching: boolean
+  searchFailed: string | null
+  search: SearchResult | null
+  listingTab: 'shoppable' | 'reference'
+  setListingTab: (t: 'shoppable' | 'reference') => void
+  sort: SortKey
+  setSort: (s: SortKey) => void
+  offersForTab: Offer[]
+  summary: ReturnType<typeof summarize>
+  collected: ReturnType<typeof getCollectedPoints>
+  collectedCurrency: string
+  identity: ProductIdentity | null
+  isSaved: boolean
+  onWishlist: (identity: ProductIdentity) => void
+  onAlert: (identity: ProductIdentity) => void
+  onSelectOffer: (o: Offer) => void
+  onOpenLocation: () => void
+  collectedCount: number
 }
 
-function CompareView({
-  query, setQuery, product, mode, setMode, sort, setSort,
-  filters, setFilters, showFilters, setShowFilters,
-  providerFilter, setProviderFilter,
-  filteredOffers, summary, instantCount, normalCount,
-  isSaved, searchOpen, setSearchOpen, searchRef,
-  onSearch, onRun, onRefresh, onShare, onWishlist, onSetAlert,
-  onSelectOffer, isRefreshing,
-}: CompareViewProps) {
-  const insight = priceInsight(product.priceHistory, product.priceHistory.points[product.priceHistory.points.length - 1]?.price ?? 0)
-  const activeProviderIds = [...new Set(product.offers.filter((o) => mode === 'all' || o.mode === mode).map((o) => o.provider.id))]
+function CompareView(p: CompareViewProps) {
+  const { search } = p
+  const hasOffers = !!search?.offers.length
+  const series = buildSeries(p.collected, p.collectedCurrency)
+  const insight = collectedInsight(p.collected, p.collectedCurrency)
 
   return (
-    <>
-      {/* Hero & Search */}
+    <div className="page-content">
+      {/* Hero & search */}
       <section className="hero-section">
         <div className="hero-copy">
           <p className="eyebrow">
             <span className="eyebrow-spark"><Sparkles size={11} /></span>
-            AI-powered price comparison
+            Real-data-only price comparison
           </p>
           <h1>
             One product.<br />
-            <em>Every price.</em>{' '}
-            <span>One smart choice.</span>
+            <em>Every verified price.</em>{' '}
+            <span>Nothing invented.</span>
           </h1>
           <p className="hero-description">
-            PriceRadar compares the true payable price — product cost, all fees, discounts — across instant delivery and e-commerce platforms simultaneously.
+            PriceRadar retrieves live listings from authorized sources, matches the exact product, and
+            shows real prices with their provenance. When a source has no data, we say so — we never
+            fill the page with made-up offers.
           </p>
         </div>
 
-        <div className="hero-proof">
-          <div className="proof-avatars" aria-hidden="true">
-            <span>AK</span><span>SR</span><span>RP</span>
-          </div>
-          <div>
-            <strong>{providers.filter((p) => p.isConnected).length} connected sources</strong>
-            <span>Updated just now</span>
-          </div>
-          <ShieldCheck size={18} />
-        </div>
-
-        {/* Search bar */}
-        <form className="search-bar" role="search" onSubmit={onSearch}>
+        <form className="search-bar" role="search" onSubmit={p.onSearch}>
           <span className="search-icon"><Search size={19} /></span>
           <input
-            ref={searchRef}
-            value={query}
-            onChange={(e) => setQuery(e.target.value)}
-            onFocus={() => setSearchOpen(true)}
-            onBlur={() => setTimeout(() => setSearchOpen(false), 180)}
-            placeholder="Search any product, brand, or ask a question…"
+            ref={p.searchInputRef}
+            value={p.query}
+            onChange={(e) => p.setQuery(e.target.value)}
+            placeholder="Search a product, brand, or paste a barcode…"
             aria-label="Search for a product"
             autoComplete="off"
           />
-          <kbd aria-hidden="true">⏎</kbd>
-          <button type="submit" className="search-submit">
-            <Search size={14} /> Compare now
+          <button type="submit" className="search-submit" disabled={p.searching}>
+            <Search size={14} />
+            {p.searching ? 'Retrieving…' : 'Search live sources'}
           </button>
         </form>
 
-        {searchOpen && (
-          <div className="search-suggestions" role="listbox" aria-label="Search suggestions">
-            <div className="suggestions-heading">
-              <span>Trending searches</span>
-              <span>Press ↵ to search</span>
-            </div>
-            {SEARCH_SUGGESTIONS.map((s) => (
-              <button
-                key={s.label}
-                role="option"
-                onMouseDown={() => onRun(s.label)}
-              >
-                <span className="suggestion-icon"><Sparkles size={13} /></span>
-                <span>
-                  <span className="suggestion-label">{s.label}</span>
-                  <span className="suggestion-hint">{s.hint}</span>
-                </span>
-                <ArrowUpRight size={13} />
-              </button>
-            ))}
-            <div className="suggestions-hint">
-              <Sparkles size={12} /> Natural language supported — try "cheap airpods near me"
-            </div>
+        <div className="search-suggestions" role="listbox" aria-label="Search ideas">
+          <div className="suggestions-heading">
+            <span>Try a real search</span>
+            <span>Every query hits live sources</span>
           </div>
-        )}
+          {SEARCH_HINTS.map((s) => (
+            <button key={s.label} role="option" onMouseDown={() => { p.setQuery(s.label); p.onRun(s.label) }}>
+              <span className="suggestion-icon">{s.label.match(/^\d+$/) ? <ScanBarcode size={13} /> : <Search size={13} />}</span>
+              <span>
+                <span className="suggestion-label">{s.label}</span>
+                <span className="suggestion-hint">{s.hint}</span>
+              </span>
+              <ArrowUpRight size={13} />
+            </button>
+          ))}
+        </div>
       </section>
 
-      <div className="page-content">
-        {/* Product overview card */}
-        <div className="section-heading">
-          <div>
-            <p className="section-kicker">
-              <span className="live-dot" aria-hidden="true" />
-              {product.offers.length} offers found
-            </p>
-            <h2>Comparing {product.name}</h2>
-            <p className="section-subtitle">
-              <strong>{product.variant}</strong> · <span>{product.quantity}</span> ·{' '}
-              <span>{product.category}</span>
-            </p>
-          </div>
-          <div className="heading-actions">
-            <button className="secondary-button" onClick={onShare}><Share2 size={14} /> Share</button>
-            <button className="secondary-button" onClick={onSetAlert}><Bell size={14} /> Set alert</button>
-            <button
-              className={`secondary-button${isSaved ? ' saved' : ''}`}
-              onClick={onWishlist}
-              aria-label={isSaved ? 'Remove from wishlist' : 'Save to wishlist'}
-            >
-              <Heart size={14} fill={isSaved ? 'currentColor' : 'none'} />
-              {isSaved ? 'Saved' : 'Save'}
-            </button>
-          </div>
-        </div>
+      {p.searching && <SearchSkeleton />}
 
-        <div className="product-overview-card">
-          <div className="product-overview-main">
-            <div className="product-art-wrap">
-              <ProductArt kind={product.imageKind} size="lg" />
-            </div>
-            <div className="product-overview-copy">
-              <div className="product-kicker">
-                <span>{product.category}</span>
-                {product.isDefinitiveMatch && (
-                  <span className="match-pill"><Check size={10} /> Verified product</span>
-                )}
+      {!p.searching && p.searchFailed && (
+        <EmptyState
+          icon={<AlertCircle size={22} />}
+          title="Search could not be completed"
+          body={p.searchFailed}
+          actions={
+            <button className="primary-button" onClick={() => p.onRun(p.query)}>
+              <RefreshCw size={14} /> Try again
+            </button>
+          }
+        />
+      )}
+
+      {!p.searching && !p.searchFailed && search && (
+        <>
+          {/* Identity */}
+          <IdentityCard
+            identity={search.identity}
+            status={search.identityStatus}
+            note={search.identityNote}
+            candidates={search.candidates}
+            onRun={p.onRun}
+            isSaved={p.isSaved}
+            onWishlist={p.onWishlist}
+            onAlert={p.onAlert}
+            hasOffers={hasOffers}
+          />
+
+          {/* Source status strip */}
+          <SourceStatusStrip results={search.results} />
+
+          {/* Summary */}
+          {hasOffers && <SummaryCards summary={p.summary} />}
+
+          {/* Offers / empty state */}
+          {!hasOffers && (
+            <EmptyState
+              icon={<PackageOpen size={22} />}
+              title="No verified prices found"
+              body={
+                <>
+                  We couldn’t retrieve verified pricing for this product right now.
+                  {search.results.some((r) => r.status === 'auth_required') && ' Connect an authorized source below to unlock more results.'}
+                  {search.results.every((r) => !r.offers.length) && search.identity && ' The product resolved, but no integrated source returned a listing for it.'}
+                </>
+              }
+              actions={
+                <>
+                  <button className="primary-button" onClick={() => p.onRun(search.query)}>
+                    <RefreshCw size={14} /> Try again
+                  </button>
+                  <button className="secondary-button" onClick={p.onOpenLocation}>
+                    <MapPin size={14} /> Change location
+                  </button>
+                  <button className="secondary-button" onClick={() => p.searchInputRef.current?.focus()}>
+                    <Search size={14} /> Search another product
+                  </button>
+                </>
+              }
+            />
+          )}
+
+          {hasOffers && (
+            <>
+              <div className="controls-row">
+                <div className="mode-tabs" role="tablist" aria-label="Result type">
+                  <button
+                    role="tab"
+                    aria-selected={p.listingTab === 'shoppable'}
+                    className={`mode-tab${p.listingTab === 'shoppable' ? ' active' : ''}`}
+                    onClick={() => p.setListingTab('shoppable')}
+                  >
+                    Buyable listings
+                    <span className="tab-count">{search.offers.filter((o) => o.kind === 'shoppable').length}</span>
+                  </button>
+                  <button
+                    role="tab"
+                    aria-selected={p.listingTab === 'reference'}
+                    className={`mode-tab${p.listingTab === 'reference' ? ' active' : ''}`}
+                    onClick={() => p.setListingTab('reference')}
+                  >
+                    Reference prices
+                    <span className="tab-count">{search.offers.filter((o) => o.kind === 'reference').length}</span>
+                  </button>
+                </div>
+                <div className="sort-wrap">
+                  <label htmlFor="sort-select">Sort</label>
+                  <select id="sort-select" value={p.sort} onChange={(e) => p.setSort(e.target.value as SortKey)}>
+                    {SORT_OPTIONS.map((o) => <option key={o.value} value={o.value}>{o.label}</option>)}
+                  </select>
+                </div>
               </div>
-              <h3>{product.name}</h3>
-              <p>
-                {product.brand} <span>·</span> {product.variant} <span>·</span> {product.quantity}
-              </p>
-              {product.description && (
-                <p className="product-description">{product.description}</p>
-              )}
-              <div className="overview-meta">
-                {product.gtin && (
-                  <span><Tag size={12} /> GTIN: {product.gtin}</span>
-                )}
-                {product.sku && (
-                  <span><ShoppingBag size={12} /> SKU: {product.sku}</span>
-                )}
-                <span><Globe2 size={12} /> {product.offers.length} sources</span>
-              </div>
-              {/* Specs */}
-              {product.specs && product.specs.length > 0 && (
-                <div className="product-specs">
-                  {product.specs.map((s) => (
-                    <span key={s.label} className="spec-chip">
-                      <strong>{s.label}:</strong> {s.value}
-                    </span>
+
+              {p.offersForTab.length === 0 ? (
+                <EmptyState
+                  icon={<PackageOpen size={22} />}
+                  title={`No ${p.listingTab === 'shoppable' ? 'buyable listings' : 'reference prices'} for this search`}
+                  body={
+                    p.listingTab === 'shoppable'
+                      ? 'No integrated source returned a purchasable listing. Reference prices from open datasets may still be available in the other tab.'
+                      : 'No community-recorded prices exist for this exact product yet.'
+                  }
+                />
+              ) : (
+                <div className="offers-grid">
+                  {p.offersForTab.map((o) => (
+                    <OfferCard key={o.id} offer={o} onSelect={p.onSelectOffer} />
                   ))}
                 </div>
               )}
-            </div>
-          </div>
-
-          {/* Price history mini */}
-          <div className="trend-overview">
-            <div className="trend-head">
-              <span className="trend-label">Price trend</span>
-              <span className={`trend-badge ${product.priceHistory.trend}`}>
-                {product.priceHistory.trend === 'down' ? <TrendingDown size={12} /> : product.priceHistory.trend === 'up' ? <TrendingUp size={12} /> : <Minus size={12} />}
-                {Math.abs(product.priceHistory.changePercent)}%
-              </span>
-            </div>
-            <MiniChart history={product.priceHistory} />
-            <div className="trend-stats">
-              <div><span>Lowest</span><strong className="green">{formatRupees(product.priceHistory.lowest)}</strong></div>
-              <div><span>Average</span><strong>{formatRupees(product.priceHistory.average)}</strong></div>
-              <div><span>Highest</span><strong className="red">{formatRupees(product.priceHistory.highest)}</strong></div>
-            </div>
-            <p className="trend-insight"><Info size={11} /> {insight}</p>
-          </div>
-        </div>
-
-        {/* Comparison summary (best price / fastest / best overall) */}
-        {(summary.bestPrice || summary.fastest || summary.bestOverall) && (
-          <div className="summary-row">
-            {summary.bestPrice && (
-              <SummaryCard
-                icon={<WalletCards size={16} />}
-                label="Best Price"
-                offer={summary.bestPrice}
-                highlight="green"
-                onClick={() => onSelectOffer(summary.bestPrice!)}
-              />
-            )}
-            {summary.fastest && (
-              <SummaryCard
-                icon={<Zap size={16} />}
-                label="Fastest"
-                offer={summary.fastest}
-                highlight="blue"
-                onClick={() => onSelectOffer(summary.fastest!)}
-              />
-            )}
-            {summary.bestOverall && (
-              <SummaryCard
-                icon={<Star size={16} />}
-                label="Best Overall"
-                offer={summary.bestOverall}
-                highlight="yellow"
-                onClick={() => onSelectOffer(summary.bestOverall!)}
-              />
-            )}
-          </div>
-        )}
-
-        {/* Mode tabs + controls */}
-        <div className="controls-row">
-          <div className="mode-tabs" role="tablist" aria-label="Delivery mode">
-            {[
-              { value: 'instant' as Mode, label: '⚡ Instant', count: instantCount },
-              { value: 'normal'  as Mode, label: '📦 E-Commerce', count: normalCount },
-              { value: 'all'     as Mode, label: '🌐 Compare All', count: product.offers.length },
-            ].map(({ value, label, count }) => (
-              <button
-                key={value}
-                className={`mode-tab${mode === value ? ' active' : ''}`}
-                onClick={() => setMode(value)}
-                role="tab"
-                aria-selected={mode === value}
-              >
-                {label}
-                <span className="tab-count">{count}</span>
-              </button>
-            ))}
-          </div>
-
-          <div className="control-actions">
-            <div className="sort-wrap">
-              <label htmlFor="sort-select" className="sr-only">Sort by</label>
-              <ListFilter size={14} />
-              <select
-                id="sort-select"
-                value={sort}
-                onChange={(e) => setSort(e.target.value as SortKey)}
-              >
-                {SORT_OPTIONS.map((o) => (
-                  <option key={o.value} value={o.value}>{o.label}</option>
-                ))}
-              </select>
-            </div>
-            <button
-              className={`secondary-button${showFilters ? ' active' : ''}`}
-              onClick={() => setShowFilters(!showFilters)}
-              aria-expanded={showFilters}
-            >
-              <Filter size={13} /> Filters
-              {(filters.providers.length > 0 || filters.priceMin || filters.priceMax) && (
-                <span className="filter-badge">!</span>
-              )}
-            </button>
-            <button
-              className={`secondary-button${filters.exactOnly ? ' active' : ''}`}
-              onClick={() => setFilters({ ...filters, exactOnly: !filters.exactOnly })}
-              title={filters.exactOnly ? 'Showing exact matches only' : 'Showing all matches'}
-            >
-              <ShieldCheck size={13} />
-              {filters.exactOnly ? 'Exact only' : 'All matches'}
-            </button>
-          </div>
-        </div>
-
-        {/* Filter panel */}
-        {showFilters && (
-          <FilterPanel
-            filters={filters}
-            setFilters={setFilters}
-            activeProviderIds={activeProviderIds}
-            onReset={() => setFilters({ priceMin: '', priceMax: '', providers: [], availability: false, exactOnly: true })}
-          />
-        )}
-
-        {/* Provider filter pills */}
-        {activeProviderIds.length > 1 && (
-          <div className="provider-pills">
-            <button
-              className={`provider-pill${providerFilter === 'all' ? ' active' : ''}`}
-              onClick={() => setProviderFilter('all')}
-            >
-              All providers
-            </button>
-            {activeProviderIds.map((pid) => {
-              const prov = providers.find((p) => p.id === pid)
-              if (!prov) return null
-              return (
-                <button
-                  key={pid}
-                  className={`provider-pill${providerFilter === pid ? ' active' : ''}`}
-                  onClick={() => setProviderFilter(pid)}
-                  style={{ '--pcolor': prov.color } as CSSProperties}
-                >
-                  <span className="provider-dot" style={{ background: prov.color }} />
-                  {prov.name}
-                </button>
-              )
-            })}
-          </div>
-        )}
-
-        {/* Offers */}
-        {filteredOffers.length === 0 ? (
-          <EmptyState
-            icon={<Search size={28} />}
-            title="No offers match your filters"
-            description="Try adjusting the filters, mode, or match confidence settings."
-            action={<button className="primary-button" onClick={() => setFilters({ priceMin: '', priceMax: '', providers: [], availability: false, exactOnly: true })}>Clear filters</button>}
-          />
-        ) : (
-          <div className="offers-grid" aria-label="Price comparison results">
-            {filteredOffers.map((offer, i) => (
-              <OfferCard
-                key={offer.id}
-                offer={offer}
-                rank={i + 1}
-                isBestPrice={offer.id === summary.bestPrice?.id}
-                isFastest={offer.id === summary.fastest?.id}
-                isBestOverall={offer.id === summary.bestOverall?.id}
-                onClick={() => onSelectOffer(offer)}
-              />
-            ))}
-          </div>
-        )}
-
-
-
-        {/* Alternatives */}
-        {product.alternatives && product.alternatives.length > 0 && (
-          <div className="alternatives-section">
-            <div className="section-heading">
-              <div>
-                <p className="section-kicker"><Sparkles size={12} /> AI Recommendations</p>
-                <h2>Cheaper alternatives</h2>
-                <p className="section-subtitle">Different products — clearly labelled. Compare separately.</p>
-              </div>
-            </div>
-            <div className="alternatives-grid">
-              {product.alternatives.map((alt) => (
-                <div key={alt.id} className="alternative-card">
-                  <div className="alt-art"><ProductArt kind={alt.imageKind} size="sm" /></div>
-                  <div className="alt-copy">
-                    <div className="alt-badge">Alternative product</div>
-                    <strong>{alt.name}</strong>
-                    <span>{alt.brand} · {alt.variant} · {alt.quantity}</span>
-                    <div className="alt-price">
-                      <span className="alt-best">{formatRupees(alt.bestPrice)}</span>
-                      <span className="alt-via">at {alt.bestProvider}</span>
-                    </div>
-                    {alt.savings > 0 && (
-                      <p className="alt-savings"><TrendingDown size={12} /> Saves ₹{alt.savings.toLocaleString('en-IN')} — {alt.savingsReason}</p>
-                    )}
-                  </div>
-                  <button
-                    className="alt-compare"
-                    onClick={() => {
-                      /* In a real app this would navigate to the alt product */
-                    }}
-                  >
-                    Compare <ChevronRight size={14} />
-                  </button>
-                </div>
-              ))}
-            </div>
-          </div>
-        )}
-
-        {/* Full price history chart */}
-        <PriceHistorySection product={product} />
-      </div>
-    </>
-  )
-}
-
-// ─── Summary Card ─────────────────────────────────────────────────────────────
-
-function SummaryCard({
-  icon, label, offer, highlight, onClick,
-}: { icon: ReactNode; label: string; offer: Offer; highlight: string; onClick: () => void }) {
-  const fp = finalPrice(offer)
-  return (
-    <button className={`summary-card highlight-${highlight}`} onClick={onClick}>
-      <div className="summary-icon">{icon}</div>
-      <div className="summary-copy">
-        <span className="summary-label">{label}</span>
-        <strong className="summary-provider">{offer.provider.name}</strong>
-        <span className="summary-price">{formatRupees(fp)}</span>
-        {label === 'Fastest' && <span className="summary-meta">{offer.etaLabel}</span>}
-        {label !== 'Fastest' && fp && <span className="summary-meta">incl. all fees</span>}
-      </div>
-      <div className="summary-provider-mark" style={{ background: offer.provider.color, color: offer.provider.background }}>
-        {offer.provider.mark}
-      </div>
-    </button>
-  )
-}
-
-// ─── Offer Card ───────────────────────────────────────────────────────────────
-
-function OfferCard({
-  offer, rank, isBestPrice, isFastest, isBestOverall, onClick,
-}: {
-  offer: Offer; rank: number
-  isBestPrice: boolean; isFastest: boolean; isBestOverall: boolean
-  onClick: () => void
-}) {
-  const fp = finalPrice(offer)
-  const disc = discountPercent(offer)
-  const badges: Array<{ label: string; cls: string }> = []
-  if (isBestPrice)   badges.push({ label: '🏆 Best Price',    cls: 'badge-green' })
-  if (isFastest)     badges.push({ label: '⚡ Fastest',       cls: 'badge-blue' })
-  if (isBestOverall) badges.push({ label: '💰 Best Overall',  cls: 'badge-yellow' })
-
-  return (
-    <article
-      className={`offer-card${offer.availability === 'unavailable' ? ' unavailable' : ''}${isBestOverall ? ' card-best' : ''}`}
-      aria-label={`${offer.provider.name} — ${formatRupees(fp)}`}
-    >
-      {/* Provider bar */}
-      <div className="offer-provider-bar" style={{ background: offer.provider.background }}>
-        <div className="offer-provider-mark" style={{ color: offer.provider.color }}>
-          {offer.provider.mark}
-        </div>
-        <span className="offer-provider-name" style={{ color: offer.provider.color }}>
-          {offer.provider.name}
-        </span>
-        <div className="offer-freshness">
-          {offer.freshness === 'live' ? (
-            <span className="freshness-live"><span className="tiny-live-dot" /> Live</span>
-          ) : (
-            <span className="freshness-cached">{offer.updatedSeconds}s ago</span>
+            </>
           )}
+
+          {/* Collected price history */}
+          {search.identity && (
+            <section className="history-chart-section" aria-label="Collected price history">
+              <div className="section-heading">
+                <div>
+                  <p className="section-kicker"><TrendingUp size={12} /> Collected price history</p>
+                  <h3>Only prices PriceRadar actually recorded</h3>
+                </div>
+              </div>
+              {series.enough ? (
+                <>
+                  {insight && <p className="trend-insight">{insight}</p>}
+                  <div className="history-chart-card">
+                    <ResponsiveContainer width="100%" height={220}>
+                      <AreaChart data={series.points.map((pt) => ({
+                        date: String(pt.observedAt).slice(0, 10),
+                        price: pt.price,
+                        label: `${pt.merchant ?? pt.sourceId} · ${String(pt.observedAt).slice(0, 10)}`,
+                      }))}>
+                        <defs>
+                          <linearGradient id="ph" x1="0" y1="0" x2="0" y2="1">
+                            <stop offset="0%" stopColor="var(--lime)" stopOpacity={0.5} />
+                            <stop offset="100%" stopColor="var(--lime)" stopOpacity={0.04} />
+                          </linearGradient>
+                        </defs>
+                        <CartesianGrid strokeDasharray="3 3" stroke="var(--grid)" />
+                        <XAxis dataKey="date" tick={{ fontSize: 11 }} stroke="var(--muted)" />
+                        <YAxis tick={{ fontSize: 11 }} stroke="var(--muted)" width={52} domain={['auto', 'auto']} />
+                        <Tooltip
+                          formatter={(v: number) => [formatMoney(v, p.collectedCurrency), p.collectedCurrency]}
+                          labelFormatter={(_, payload) => (payload?.[0]?.payload?.label as string) ?? ''}
+                        />
+                        <Area type="monotone" dataKey="price" stroke="var(--lime)" fill="url(#ph)" strokeWidth={2} />
+                      </AreaChart>
+                    </ResponsiveContainer>
+                    <p className="chart-disclaimer">
+                      {p.collectedCurrency} observations recorded by this PriceRadar install from real
+                      retrievals and open datasets — {series.points.length} point(s). No generated history.
+                    </p>
+                  </div>
+                </>
+              ) : (
+                <div className="empty-state history-empty">
+                  <div className="empty-icon"><TrendingUp size={20} /></div>
+                  <h4>Not enough historical data yet.</h4>
+                  <p>
+                    {p.collected.length === 0
+                      ? 'PriceRadar hasn’t recorded any price for this product yet. Every search adds real observations.'
+                      : `Only ${p.collected.length} observation(s) recorded so far — at least two on different dates are needed before a trend chart is shown.`}
+                  </p>
+                </div>
+              )}
+            </section>
+          )}
+        </>
+      )}
+
+      {!p.searching && !p.searchFailed && !search && (
+        <EmptyState
+          icon={<Radar size={22} />}
+          title="Start with a real search"
+          body={
+            <>
+              Search a packaged product by name or barcode. PriceRadar will resolve the exact product via
+              Open Food Facts and query every connected price source. Until sources return data, this page
+              stays honest — empty, not fabricated.
+              <span className="empty-note">
+                {p.collectedCount > 0
+                  ? ` Your workspace has ${p.collectedCount} recorded real price observation(s).`
+                  : ' Connect authorized sources in Data sources for wider coverage.'}
+              </span>
+            </>
+          }
+        />
+      )}
+    </div>
+  )
+}
+
+// ─── Search skeleton ──────────────────────────────────────────────────────────
+
+function SearchSkeleton() {
+  return (
+    <div className="search-progress" role="status" aria-live="polite">
+      <div className="search-progress-row">
+        <span className="pulse-dot" aria-hidden="true" />
+        <span>Resolving product identity in Open Food Facts…</span>
+      </div>
+      <div className="search-progress-row muted">
+        <span>Querying connected sources (authorized APIs only)…</span>
+      </div>
+      <div className="search-progress-row muted">
+        <span>Unresponsive sources will be listed as unavailable — never estimated.</span>
+      </div>
+    </div>
+  )
+}
+
+// ─── Identity card ────────────────────────────────────────────────────────────
+
+function IdentityCard(props: {
+  identity: ProductIdentity | null
+  status: ProviderStatus
+  note?: string
+  candidates: ProductIdentity[]
+  onRun: (q: string) => void
+  isSaved: boolean
+  onWishlist: (identity: ProductIdentity) => void
+  onAlert: (identity: ProductIdentity) => void
+  hasOffers: boolean
+}) {
+  const { identity } = props
+  if (!identity) {
+    return (
+      <div className="identity-card unresolved">
+        <div className="identity-icon"><ScanBarcode size={20} /></div>
+        <div className="identity-body">
+          <p className="section-kicker">Product identity</p>
+          <h3>No verified product identity found</h3>
+          <p className="identity-note">
+            {props.note ?? 'The identity source returned no match for this search, so nothing can be compared — a wrong match would be worse than none.'}
+          </p>
         </div>
+        <StatusChip status={props.status} />
+      </div>
+    )
+  }
+  const fresh = describeFreshness(identity.retrievedAt)
+  return (
+    <div className="identity-card">
+      {identity.imageUrl ? (
+        <img className="identity-image" src={identity.imageUrl} alt={identity.name} loading="lazy" />
+      ) : (
+        <div className="identity-image identity-image-fallback" aria-hidden="true">
+          {identity.name.slice(0, 1).toUpperCase()}
+        </div>
+      )}
+      <div className="identity-body">
+        <p className="section-kicker">
+          <BadgeCheck size={12} /> Verified product identity · {identity.sourceName}
+        </p>
+        <h3>{identity.name}</h3>
+        <div className="identity-meta">
+          {identity.brand && <span className="chip">{identity.brand}</span>}
+          {identity.quantity && <span className="chip">{identity.quantity}</span>}
+          {identity.barcode && <span className="chip mono"><ScanBarcode size={11} /> {identity.barcode}</span>}
+          <span className={`freshness-${fresh.cls === 'live' ? 'live' : 'cached'}`}>{fresh.label}</span>
+        </div>
+      </div>
+      <div className="identity-actions">
+        <a className="icon-button" href={identity.url} target="_blank" rel="noreferrer noopener" aria-label={`View ${identity.name} on ${identity.sourceName}`} title="View source record">
+          <ExternalLink size={16} />
+        </a>
+        <button className="icon-button" onClick={() => props.onWishlist(identity)} aria-label={props.isSaved ? 'Remove from wishlist' : 'Save to wishlist'} title={props.isSaved ? 'Remove from wishlist' : 'Save to wishlist'}>
+          <Heart size={16} fill={props.isSaved ? 'currentColor' : 'none'} />
+        </button>
+        <button className="secondary-button" onClick={() => props.onAlert(identity)}>
+          <Bell size={14} /> Alert
+        </button>
+      </div>
+      {props.candidates.length > 0 && (
+        <div className="identity-candidates">
+          <span>Other real matches found:</span>
+          {props.candidates.slice(0, 3).map((c) => (
+            <button key={c.id} className="chip chip-button" onClick={() => props.onRun(c.barcode ?? c.name)} title={c.name}>
+              {c.name.slice(0, 42)}{c.name.length > 42 ? '…' : ''}{c.quantity ? ` · ${c.quantity}` : ''}
+            </button>
+          ))}
+        </div>
+      )}
+    </div>
+  )
+}
+
+function StatusChip({ status }: { status: ProviderStatus }) {
+  const meta = STATUS_META[status]
+  return <span className={`status-chip ${meta.cls}`}>{meta.label}</span>
+}
+
+// ─── Source status strip ──────────────────────────────────────────────────────
+
+function SourceStatusStrip({ results }: { results: ProviderResult[] }) {
+  return (
+    <section className="source-strip" aria-label="Per-source retrieval status">
+      <p className="section-kicker"><Database size={12} /> Source status on this search</p>
+      <div className="source-strip-grid">
+        {results.map((r) => {
+          const meta = STATUS_META[r.status]
+          const detail = r.offers.length
+            ? `${r.offers.length} result(s) · ${r.latencyMs !== null ? `${r.latencyMs} ms` : ''}`
+            : (r.note ?? r.error ?? 'No results')
+          return (
+            <div key={r.sourceId} className={`source-chip ${meta.cls}`} title={detail}>
+              <span className="source-chip-name">{r.sourceName}</span>
+              <span className="source-chip-status">
+                {r.status === 'live' ? `✓ Live · ${r.offers.length}` : `✗ ${meta.label}`}
+              </span>
+              <span className="source-chip-detail">{detail}</span>
+            </div>
+          )
+        })}
+      </div>
+    </section>
+  )
+}
+
+// ─── Summary cards ────────────────────────────────────────────────────────────
+
+function SummaryCards({ summary }: { summary: ReturnType<typeof summarize> }) {
+  if (!summary.bestPrice) return null
+  const { bestPrice, fastest, savings } = summary
+  const cards = [
+    {
+      key: 'best', icon: <BadgeCheck size={16} />, label: 'Best verified price',
+      price: priceLine(bestPrice),
+      provider: `${bestPrice.sourceName}${bestPrice.merchant && bestPrice.merchant !== bestPrice.sourceName ? ` · ${bestPrice.merchant}` : ''}`,
+      meta: bestPrice.productUrl ? 'Real listing · fees as disclosed' : 'Fees undisclosed → at checkout',
+      extra: savings ? `${formatMoney(savings, bestPrice.currency)} below next verified option` : undefined,
+    },
+    fastest ? {
+      key: 'fast', icon: <Truck size={16} />, label: 'Fastest verified delivery',
+      price: fastest.etaMinutes !== null ? `~${fastest.etaMinutes} min` : (fastest.deliveryNote ?? 'Estimate unavailable'),
+      provider: `${fastest.sourceName}${fastest.merchant && fastest.merchant !== fastest.sourceName ? ` · ${fastest.merchant}` : ''}`,
+      meta: fastest.etaMinutes === null && !fastest.deliveryNote
+        ? 'No source-supplied ETA — not guessed'
+        : (fastest.deliveryNote ?? 'Source-supplied estimate'),
+    } : null,
+  ].filter(Boolean) as Array<{ key: string; icon: ReactNode; label: string; price: string; provider: string; meta: string; extra?: string }>
+
+  return (
+    <div className="summary-row">
+      {cards.map((c) => (
+        <div key={c.key} className="summary-card">
+          <div className="summary-icon">{c.icon}</div>
+          <div className="summary-copy">
+            <span className="summary-label">{c.label}</span>
+            <span className="summary-price">{c.price}</span>
+            <span className="summary-provider">{c.provider}</span>
+            <span className="summary-meta">{c.meta}{c.extra ? ` · ${c.extra}` : ''}</span>
+          </div>
+        </div>
+      ))}
+    </div>
+  )
+}
+
+// ─── Offer card ───────────────────────────────────────────────────────────────
+
+function OfferCard({ offer, onSelect }: { offer: Offer; onSelect: (o: Offer) => void }) {
+  const fresh = offerFreshness(offer)
+  const disc = discountPercent(offer)
+  const isRef = offer.kind === 'reference'
+  return (
+    <article className={`offer-card${isRef ? ' reference' : ''}`}>
+      <div className="offer-provider-bar">
+        <div className="offer-provider-mark" aria-hidden="true">
+          {offer.sourceName.slice(0, 2).toUpperCase()}
+        </div>
+        <div className="offer-provider-name">
+          <strong>{offer.merchant ?? offer.sourceName}</strong>
+          <span>via {offer.sourceName}</span>
+        </div>
+        <span className={`match-pill match-${offer.match}`}>{offer.matchConfidence}</span>
       </div>
 
       <div className="offer-body">
-        {/* Badges */}
-        {badges.length > 0 && (
-          <div className="offer-badges">
-            {badges.map((b) => (
-              <span key={b.label} className={`offer-badge ${b.cls}`}>{b.label}</span>
-            ))}
-          </div>
-        )}
-
-        {/* Product info */}
-        <div className="offer-product-row">
-          <div className="offer-product-text">
-            <strong className="offer-product-name">{offer.productName}</strong>
-            <span className="offer-product-meta">{offer.variant} · {offer.quantity}</span>
-          </div>
-          <MatchBadge match={offer.match} />
+        <h4 className="offer-product-name" title={offer.productName}>{offer.productName}</h4>
+        <div className="offer-product-meta">
+          {offer.brand && <span className="chip">{offer.brand}</span>}
+          {offer.quantity && <span className="chip">{offer.quantity}</span>}
+          {offer.barcode && <span className="chip mono"><ScanBarcode size={11} /> {offer.barcode}</span>}
+          {offer.condition && <span className="chip">{offer.condition}</span>}
         </div>
 
-        {/* Price */}
         <div className="offer-price-row">
-          <div className="offer-price-main">
-            <span className="offer-final-price">{fp !== null ? formatRupees(fp) : 'See checkout'}</span>
-            {fp === null && <em className="checkout-note">Final price at checkout</em>}
-          </div>
           <div className="offer-price-detail">
-            <span className="offer-product-price">{formatRupees(offer.price)}</span>
-            {offer.mrp > offer.price && (
-              <>
-                <span className="offer-mrp">{formatRupees(offer.mrp)}</span>
-                <span className="offer-disc">{disc}% off</span>
-              </>
+            <strong className="offer-final-price">{priceLine(offer)}</strong>
+            {offer.mrp !== null && offer.mrp > offer.price && (
+              <span className="offer-mrp">
+                {formatMoney(offer.mrp, offer.currency)}
+                {disc !== null && disc > 0 ? ` · −${disc}%` : ''}
+              </span>
+            )}
+            {finalPrice(offer) === null && (
+              <span className="checkout-note">Some fees undisclosed by this source</span>
             )}
           </div>
+          <div className={`offer-freshness freshness-${fresh.cls === 'live' ? 'live' : 'cached'}`}>
+            {fresh.label}
+          </div>
         </div>
 
-        {/* Price per unit */}
-        {offer.pricePerUnit && (
-          <div className="offer-per-unit">{offer.pricePerUnit}</div>
-        )}
-
-        {/* Fee breakdown */}
-        <div className="offer-fees">
-          {offer.fees.delivery === 0
-            ? <span className="fee-free"><Check size={11} /> Free delivery</span>
-            : offer.fees.delivery !== null
-              ? <span className="fee-paid"><Truck size={11} /> ₹{offer.fees.delivery} delivery</span>
-              : <span className="fee-unknown"><Info size={11} /> Delivery at checkout</span>
-          }
-          {(offer.fees.platform ?? 0) > 0 && (
-            <span className="fee-paid">₹{offer.fees.platform} platform fee</span>
-          )}
-        </div>
-
-        {/* Delivery */}
         <div className="offer-delivery-row">
-          <div className={`offer-eta${offer.mode === 'instant' ? ' eta-instant' : ''}`}>
-            {offer.mode === 'instant' ? <Zap size={13} /> : <Truck size={13} />}
-            {offer.etaLabel}
-            {offer.deliveryDate && <span className="eta-date">· {offer.deliveryDate}</span>}
-          </div>
-          <div className={`offer-stock ${offer.availability}`}>
-            {offer.availability === 'in_stock'   && <><Check size={11} /> {offer.stockLabel}</>}
-            {offer.availability === 'low_stock'  && <><AlertCircle size={11} /> {offer.stockLabel}</>}
-            {offer.availability === 'unavailable' && <><X size={11} /> Unavailable</>}
-          </div>
-        </div>
-
-        {/* Seller */}
-        <div className="offer-seller-row">
-          <span className="offer-seller">{offer.seller}</span>
-          {offer.rating && (
-            <span className="offer-rating">
-              <Star size={11} fill="currentColor" /> {offer.rating}
-              {offer.reviewCount && <span className="review-count">({offer.reviewCount})</span>}
-            </span>
+          <span className={`offer-stock avail-${offer.availability === 'in_stock' ? 'in' : offer.availability === 'out_of_stock' ? 'unavailable' : 'low'}`}>
+            {offer.stockLabel}
+          </span>
+          <span className="offer-eta">
+            <Truck size={12} />
+            {offer.deliveryNote ?? (offer.etaMinutes !== null ? `~${offer.etaMinutes} min` : 'Delivery estimate unavailable')}
+          </span>
+          {offer.locationLabel && (
+            <span className="offer-eta"><MapPin size={12} /> {offer.locationLabel}</span>
           )}
         </div>
 
-        {/* Offer label */}
-        {offer.offerLabel && (
-          <div className="offer-label-tag"><Gift size={11} /> {offer.offerLabel}</div>
+        {isRef && offer.observedAt && (
+          <p className="ref-observed">
+            <Clock3 size={12} /> Observed {String(offer.observedAt).slice(0, 10)} — community-recorded reference price, not a buyable listing.
+          </p>
         )}
+        {offer.offerLabel && <span className="offer-badge">{offer.offerLabel}</span>}
 
-        {/* Actions */}
         <div className="offer-actions">
-          <button className="offer-details-btn" onClick={onClick}>
-            View details <ChevronRight size={14} />
+          <button className="offer-details-btn" onClick={() => onSelect(offer)}>
+            Details &amp; provenance
           </button>
-          <a
-            className="offer-link-btn"
-            href={offer.url}
-            target="_blank"
-            rel="noreferrer"
-            aria-label={`View ${offer.productName} on ${offer.provider.name}`}
-          >
-            <ExternalLink size={14} /> Open
-          </a>
+          {offer.productUrl ? (
+            <a className="offer-link-btn" href={offer.productUrl} target="_blank" rel="noreferrer noopener">
+              View on provider <ExternalLink size={12} />
+            </a>
+          ) : (
+            <span className="offer-link-btn none" title="This source does not expose a listing URL">No listing link</span>
+          )}
         </div>
       </div>
     </article>
   )
 }
 
-// ─── Mini Chart ───────────────────────────────────────────────────────────────
+// ─── Offer modal (fee breakdown + provenance) ─────────────────────────────────
 
-function MiniChart({ history }: { history: Product['priceHistory'] }) {
-  const data = history.points.slice(-14).map((p) => ({
-    date: p.date.slice(5),  // MM-DD
-    price: p.price,
-  }))
-  if (data.length < 2) return null
-  const color = history.trend === 'down' ? '#65b88c' : history.trend === 'up' ? '#ec8d76' : '#a99ae9'
+function OfferModal({ offer, onClose }: { offer: Offer; onClose: () => void }) {
+  const rows = buildFeeRows(offer)
+  const total = finalPrice(offer)
+  const fresh = offerFreshness(offer)
   return (
-    <div className="mini-chart" aria-hidden="true">
-      <ResponsiveContainer width="100%" height={52}>
-        <AreaChart data={data} margin={{ top: 4, right: 2, left: 2, bottom: 0 }}>
-          <defs>
-            <linearGradient id="mcGrad" x1="0" y1="0" x2="0" y2="1">
-              <stop offset="5%" stopColor={color} stopOpacity={0.28} />
-              <stop offset="95%" stopColor={color} stopOpacity={0} />
-            </linearGradient>
-          </defs>
-          <Area type="monotone" dataKey="price" stroke={color} strokeWidth={1.8} fill="url(#mcGrad)" dot={false} />
-        </AreaChart>
-      </ResponsiveContainer>
+    <div className="modal-backdrop" role="dialog" aria-modal="true" onMouseDown={(e) => { if (e.target === e.currentTarget) onClose() }}>
+      <div className="modal-body offer-modal">
+        <div className="modal-kicker"><ShieldCheck size={14} /> Full provenance</div>
+        <h3>{offer.productName}</h3>
+
+        <div className="breakdown-box">
+          <div className="breakdown-head">
+            <span>Estimated payable price</span>
+            <strong>{total === null ? `${formatMoney(offer.price, offer.currency)} + checkout charges` : formatMoney(total, offer.currency)}</strong>
+          </div>
+          {rows.map(([label, value]) => (
+            <div className="breakdown-row" key={label}>
+              <span>{label}</span>
+              <span className={value === null ? 'fee-unknown' : value < 0 ? 'fee-free' : 'fee-paid'}>
+                {value === null ? 'Unknown — shown at checkout' : formatMoney(value, offer.currency)}
+              </span>
+            </div>
+          ))}
+          {offer.fees.note && <p className="fee-note">{offer.fees.note}</p>}
+          {total === null && (
+            <p className="fee-note">
+              Unknown charges are never assumed to be zero. The final payable amount is confirmed at checkout.
+            </p>
+          )}
+        </div>
+
+        <div className="modal-facts">
+          <div className="modal-meta-row"><span>Source</span><strong>{offer.sourceName}</strong></div>
+          {offer.merchant && <div className="modal-meta-row"><span>Merchant</span><strong>{offer.merchant}</strong></div>}
+          <div className="modal-meta-row"><span>Availability</span><strong>{offer.stockLabel}</strong></div>
+          <div className="modal-meta-row"><span>Delivery</span><strong>{offer.deliveryNote ?? (offer.etaMinutes !== null ? `~${offer.etaMinutes} min` : 'Not supplied')}</strong></div>
+          <div className="modal-meta-row"><span>Retrieved</span><strong>{new Date(offer.retrievedAt).toLocaleString('en-IN')}</strong></div>
+          {offer.observedAt && (
+            <div className="modal-meta-row"><span>Observed upstream</span><strong>{String(offer.observedAt).slice(0, 10)}</strong></div>
+          )}
+          <div className="modal-meta-row"><span>Freshness</span><strong>{fresh.label}</strong></div>
+          <div className="modal-meta-row"><span>Match</span><strong>{offer.matchConfidence} — {offer.matchReason}</strong></div>
+          <div className="modal-meta-row"><span>Product barcode</span><strong className="mono">{offer.barcode ?? 'Not supplied'}</strong></div>
+        </div>
+
+        <div className="modal-actions">
+          {offer.productUrl ? (
+            <a className="primary-modal-button" href={offer.productUrl} target="_blank" rel="noreferrer noopener">
+              View on provider <ExternalLink size={13} />
+            </a>
+          ) : (
+            <span className="secondary-modal-button none">No listing URL from this source</span>
+          )}
+          <button className="secondary-modal-button" onClick={onClose}>Close</button>
+        </div>
+      </div>
     </div>
   )
 }
 
-// ─── Price History Section ────────────────────────────────────────────────────
+// ─── Sources view ─────────────────────────────────────────────────────────────
 
-function PriceHistorySection({ product }: { product: Product }) {
-  const { priceHistory: h } = product
-  const data = h.points.map((p) => ({ date: p.date.slice(5), price: p.price }))
-  const color = h.trend === 'down' ? '#65b88c' : h.trend === 'up' ? '#ec8d76' : '#a99ae9'
-
-  return (
-    <section className="history-chart-section" aria-labelledby="history-title">
-      <div className="section-heading" style={{ marginBottom: 20 }}>
-        <div>
-          <p className="section-kicker"><History size={12} /> Price tracking</p>
-          <h2 id="history-title">Price history</h2>
-          <p className="section-subtitle">{h.period} · {data.length} data points</p>
-        </div>
-        <div className="history-summary-chips">
-          <span className="chip green">Low {formatRupees(h.lowest)}</span>
-          <span className="chip neutral">Avg {formatRupees(h.average)}</span>
-          <span className="chip red">High {formatRupees(h.highest)}</span>
-        </div>
-      </div>
-
-      <div className="history-chart-card">
-        <ResponsiveContainer width="100%" height={220}>
-          <AreaChart data={data} margin={{ top: 10, right: 20, left: 10, bottom: 0 }}>
-            <defs>
-              <linearGradient id="histGrad" x1="0" y1="0" x2="0" y2="1">
-                <stop offset="5%" stopColor={color} stopOpacity={0.3} />
-                <stop offset="95%" stopColor={color} stopOpacity={0.02} />
-              </linearGradient>
-            </defs>
-            <CartesianGrid strokeDasharray="3 3" stroke="var(--line)" />
-            <XAxis dataKey="date" tick={{ fontSize: 10, fill: 'var(--muted)' }} tickLine={false} axisLine={false} />
-            <YAxis
-              tick={{ fontSize: 10, fill: 'var(--muted)' }}
-              tickLine={false} axisLine={false}
-              tickFormatter={(v) => formatRupees(v, true)}
-              width={60}
-            />
-            <Tooltip
-              contentStyle={{ background: 'var(--surface)', border: '1px solid var(--line)', borderRadius: 10, fontSize: 12 }}
-              formatter={(v: number) => [formatRupees(v), 'Price']}
-            />
-            <ReferenceLine y={h.average} stroke="var(--muted)" strokeDasharray="4 4" label={{ value: 'Avg', fill: 'var(--muted)', fontSize: 10 }} />
-            <ReferenceLine y={h.lowest}  stroke="#65b88c" strokeDasharray="4 4" label={{ value: 'Low', fill: '#65b88c', fontSize: 10 }} />
-            <Area type="monotone" dataKey="price" stroke={color} strokeWidth={2} fill="url(#histGrad)" dot={false} activeDot={{ r: 4, fill: color }} />
-          </AreaChart>
-        </ResponsiveContainer>
-        <p className="chart-disclaimer">
-          <ShieldCheck size={12} /> Historical data from connected sources only. No values are estimated or extrapolated.
-        </p>
-      </div>
-    </section>
-  )
-}
-
-// ─── Filter Panel ─────────────────────────────────────────────────────────────
-
-function FilterPanel({
-  filters, setFilters, activeProviderIds, onReset,
-}: { filters: FilterState; setFilters: (f: FilterState) => void; activeProviderIds: string[]; onReset: () => void }) {
-  return (
-    <div className="filter-panel">
-      <div className="filter-section">
-        <strong>Price range (final)</strong>
-        <div className="price-range-inputs">
-          <input
-            type="number" placeholder="Min ₹" value={filters.priceMin}
-            onChange={(e) => setFilters({ ...filters, priceMin: e.target.value })}
-            aria-label="Minimum price"
-          />
-          <span>–</span>
-          <input
-            type="number" placeholder="Max ₹" value={filters.priceMax}
-            onChange={(e) => setFilters({ ...filters, priceMax: e.target.value })}
-            aria-label="Maximum price"
-          />
-        </div>
-      </div>
-      <div className="filter-section">
-        <strong>In stock only</strong>
-        <label className="toggle-label">
-          <input
-            type="checkbox" checked={filters.availability}
-            onChange={(e) => setFilters({ ...filters, availability: e.target.checked })}
-          />
-          <span className="toggle-switch" />
-        </label>
-      </div>
-      <div className="filter-section filter-section-wide">
-        <strong>Providers</strong>
-        <div className="filter-provider-chips">
-          {activeProviderIds.map((pid) => {
-            const p = providers.find((x) => x.id === pid)
-            if (!p) return null
-            const active = filters.providers.includes(pid)
-            return (
-              <button
-                key={pid}
-                className={`filter-chip${active ? ' active' : ''}`}
-                onClick={() =>
-                  setFilters({
-                    ...filters,
-                    providers: active
-                      ? filters.providers.filter((x) => x !== pid)
-                      : [...filters.providers, pid],
-                  })
-                }
-                style={{ '--pcolor': p.color } as CSSProperties}
-              >
-                {p.name}
-              </button>
-            )
-          })}
-        </div>
-      </div>
-      <button className="filter-reset" onClick={onReset}><X size={13} /> Reset filters</button>
-    </div>
-  )
-}
-
-// ─── Match Badge ──────────────────────────────────────────────────────────────
-
-function MatchBadge({ match }: { match: MatchLevel }) {
-  const label = matchLevelToConfidence(match)
-  const cls = match === 'exact' ? 'match-exact' : match === 'likely' ? 'match-likely' : 'match-similar'
-  const icon = match === 'exact' ? <Check size={10} /> : match === 'likely' ? <Eye size={10} /> : <AlertCircle size={10} />
-  return <span className={`match-badge ${cls}`} title={label}>{icon} {label}</span>
-}
-
-// ─── Product Art ──────────────────────────────────────────────────────────────
-
-const PRODUCT_ART: Record<string, { bg: string; emoji: string }> = {
-  milk:      { bg: '#eef5f0', emoji: '🥛' },
-  phone:     { bg: '#e8eef8', emoji: '📱' },
-  audio:     { bg: '#f0ecf8', emoji: '🎧' },
-  shampoo:   { bg: '#f5f0e8', emoji: '🧴' },
-  rice:      { bg: '#f8f4e8', emoji: '🌾' },
-  detergent: { bg: '#e8f5f0', emoji: '🧺' },
-  default:   { bg: '#f0f2ee', emoji: '📦' },
-}
-
-function ProductArt({ kind, size = 'md' }: { kind: string; size?: 'sm' | 'md' | 'lg' }) {
-  const art = PRODUCT_ART[kind] ?? PRODUCT_ART.default
-  const fontSize = size === 'lg' ? 54 : size === 'sm' ? 28 : 40
-  return (
-    <div className={`product-art product-art-${size}`} style={{ background: art.bg }} aria-hidden="true">
-      <span style={{ fontSize }}>{art.emoji}</span>
-    </div>
-  )
-}
-
-// ─── Overview View ────────────────────────────────────────────────────────────
-
-function OverviewView({
-  catalog, alerts, wishlist, onProduct, onSetAlert,
-}: {
-  catalog: Product[]
-  alerts: PriceAlert[]
-  wishlist: WishlistItem[]
-  onProduct: (p: Product) => void
-  onSetAlert: (p: Product) => void
+function SourcesView({ lastResult, registry, onToast }: {
+  lastResult: SearchResult | null
+  registry: ProviderRegistry
+  onToast: (msg: string, type?: 'success' | 'info' | 'error') => void
 }) {
-  const totalSavings = catalog.reduce((sum, p) => {
-    const best = Math.min(...p.offers.map((o) => finalPrice(o) ?? Infinity))
-    const mrp  = Math.min(...p.offers.map((o) => o.mrp))
-    return sum + Math.max(0, mrp - best)
-  }, 0)
+  const adapters = registry.list()
+  const lastById = new Map((lastResult?.results ?? []).map((r) => [r.sourceId, r]))
+  const configurable = adapters.filter((a) => CREDENTIAL_SPECS[a.id])
+  const openKeyless = adapters.filter((a) => !CREDENTIAL_SPECS[a.id] && !a.staticStatus)
+  const pending = adapters.filter((a) => a.staticStatus === 'integration_pending')
 
   return (
-    <div className="page-content utility-page">
+    <div className="page-content">
       <div className="utility-page-head">
         <div>
-          <p className="eyebrow"><span className="eyebrow-spark"><LayoutDashboard size={12} /></span> Your dashboard</p>
-          <h1>Overview</h1>
-          <p>Live snapshot of all products in your workspace.</p>
+          <p className="section-kicker"><Database size={12} /> Data sources &amp; integration status</p>
+          <h2>Where every price comes from</h2>
         </div>
       </div>
 
-      <div className="utility-stats">
+      <div className="policy-card">
+        <ShieldCheck size={18} />
         <div>
-          <span className="utility-stat-icon green"><TrendingDown size={17} /></span>
-          <div><strong>{formatRupees(totalSavings, true)}</strong><small>potential savings vs MRP</small></div>
-        </div>
-        <div>
-          <span className="utility-stat-icon yellow"><BellRing size={17} /></span>
-          <div><strong>{alerts.filter((a) => a.status === 'active').length} active</strong><small>price alerts watching</small></div>
-        </div>
-        <div>
-          <span className="utility-stat-icon purple"><Heart size={17} /></span>
-          <div><strong>{wishlist.length} saved</strong><small>products in wishlist</small></div>
-        </div>
-        <div>
-          <span className="utility-stat-icon blue"><Globe2 size={17} /></span>
-          <div><strong>{providers.filter((p) => p.isConnected).length} sources</strong><small>connected &amp; active</small></div>
+          <strong>No fabricated data — ever</strong>
+          <p>
+            PriceRadar shows a price only when an authorized source actually returned it. Sources without
+            an authorized integration are listed as pending — never simulated, scraped, or estimated.
+            Failed lookups show “unavailable”, and undisclosed fees stay “unknown until checkout”.
+          </p>
         </div>
       </div>
 
-      <section className="overview-products-section">
-        <div className="section-heading">
-          <div>
-            <p className="section-kicker">All tracked products</p>
-            <h2>Product catalog</h2>
-          </div>
-        </div>
-        <div className="overview-grid">
-          {catalog.map((p) => {
-            const best   = Math.min(...p.offers.map((o) => finalPrice(o) ?? Infinity))
-            const mrp    = p.offers[0]?.mrp ?? 0
-            const saving = Math.max(0, mrp - best)
-            const prov   = p.offers.find((o) => finalPrice(o) === best)?.provider
-            return (
-              <div key={p.id} className="overview-card">
-                <div className="ov-art"><ProductArt kind={p.imageKind} size="sm" /></div>
-                <div className="ov-copy">
-                  <span className="ov-category">{p.category}</span>
-                  <strong className="ov-name">{p.name}</strong>
-                  <span className="ov-meta">{p.variant} · {p.quantity}</span>
-                  <div className="ov-price-row">
-                    <span className="ov-best">{formatRupees(isFinite(best) ? best : null)}</span>
-                    {saving > 0 && <span className="ov-saving">-₹{saving.toLocaleString('en-IN')}</span>}
-                  </div>
-                  {prov && (
-                    <span className="ov-provider" style={{ color: prov.color, background: prov.background }}>
-                      {prov.name}
-                    </span>
-                  )}
-                  <div className="ov-trend">
-                    {p.priceHistory.trend === 'down' ? <TrendingDown size={12} className="green" /> : p.priceHistory.trend === 'up' ? <TrendingUp size={12} className="red" /> : <Minus size={12} />}
-                    <span>{Math.abs(p.priceHistory.changePercent)}% {p.priceHistory.period}</span>
-                  </div>
-                </div>
-                <div className="ov-actions">
-                  <button className="primary-button" onClick={() => onProduct(p)}>Compare</button>
-                  <button className="secondary-button" onClick={() => onSetAlert(p)}><Bell size={13} /></button>
-                </div>
-              </div>
-            )
-          })}
-        </div>
+      <section className="utility-card-head">
+        <h3>Authorized sources you can connect</h3>
+        <p>Keys are stored on this device only and travel solely to your PriceRadar gateway.</p>
       </section>
+      <div className="sources-list">
+        {configurable.map((a) => (
+          <ConfigurableSource
+            key={a.id}
+            adapterId={a.id}
+            name={a.name}
+            note={a.accessNote}
+            docsUrl={a.docsUrl}
+            last={lastById.get(a.id)}
+            onToast={onToast}
+          />
+        ))}
+      </div>
 
-      {/* Provider network — two clear groups */}
-      <section>
-        <div className="section-heading" style={{ marginBottom: 16 }}>
-          <div>
-            <p className="section-kicker">Integration status</p>
-            <h2>Provider network</h2>
-          </div>
-        </div>
+      <section className="utility-card-head">
+        <h3>Open, keyless sources</h3>
+        <p>Public open APIs — real data, no account needed. Availability depends on their service status.</p>
+      </section>
+      <div className="sources-list">
+        {openKeyless.map((a) => (
+          <SourceRow
+            key={a.id}
+            name={a.name}
+            kind={a.kind}
+            note={a.accessNote}
+            docsUrl={a.docsUrl}
+            last={lastById.get(a.id)}
+            idleStatus={registry.idleStatus(a)}
+          />
+        ))}
+      </div>
 
-        {/* Active providers */}
-        <p className="pn-group-label">
-          <span className="pulse-dot" aria-hidden="true" />
-          Active — {providers.filter((p) => p.isConnected).length} providers connected
-        </p>
-        <div className="provider-status-grid">
-          {providers.filter((p) => p.isConnected).map((p) => (
-            <div key={p.id} className="provider-status-card connected">
-              <div className="psc-mark" style={{ background: p.background, color: p.color }}>{p.mark}</div>
-              <div className="psc-info">
-                <strong>{p.name}</strong>
-                <span className="psc-kind">{p.kind}</span>
-              </div>
-              <div className="psc-status ok">
-                <Check size={12} /> Active
-              </div>
-            </div>
-          ))}
-        </div>
-
-        {/* Coming-soon providers */}
-        <p className="pn-group-label pn-group-label-soon" style={{ marginTop: 24 }}>
-          <span className="pn-soon-dot" aria-hidden="true" />
-          Coming soon — {providers.filter((p) => !p.isConnected).length} integrations in progress
-        </p>
-        <div className="provider-status-grid">
-          {providers.filter((p) => !p.isConnected).map((p) => (
-            <div key={p.id} className="provider-status-card coming-soon">
-              <div className="psc-mark psc-mark-soon">{p.mark}</div>
-              <div className="psc-info">
-                <strong>{p.name}</strong>
-                <span className="psc-kind">{p.kind}</span>
-              </div>
-              <div className="psc-status psc-status-soon">
-                Coming soon
-              </div>
-            </div>
-          ))}
-        </div>
-        <p className="pn-disclaimer">
-          <ShieldCheck size={12} />
-          PriceRadar only connects through official APIs, affiliate programmes, and provider-approved integrations.
-          New providers appear here as integrations are completed.
+      <section className="utility-card-head">
+        <h3>Pending integration — no authorized access yet</h3>
+        <p>
+          These stores have no public/authorized API PriceRadar may use. They are listed for
+          transparency; they will never return estimated data.
         </p>
       </section>
+      <div className="pending-grid">
+        {pending.map((a) => {
+          const store = PENDING_STORES.find((s) => s.id === a.id)
+          return (
+            <div key={a.id} className="pending-card" title={a.accessNote}>
+              <Lock size={13} />
+              <strong>{a.name}</strong>
+              <span>{store?.kind === 'instant' ? 'Instant delivery' : store?.kind === 'marketplace' ? 'Marketplace' : 'E-commerce'}</span>
+              <p>No authorized API yet — never simulated</p>
+            </div>
+          )
+        })}
+      </div>
     </div>
   )
 }
 
-// ─── Alerts View ──────────────────────────────────────────────────────────────
-
-function AlertsView({
-  alerts, catalog, onDelete, onAdd, onCompare,
-}: { alerts: PriceAlert[]; catalog: Product[]; onDelete: (id: string) => void; onAdd: () => void; onCompare: (id: string) => void }) {
+function SourceRow(props: {
+  name: string
+  kind: string
+  note: string
+  docsUrl?: string
+  last?: ProviderResult
+  idleStatus: ProviderStatus
+}) {
+  const status = props.last?.status ?? props.idleStatus
+  const detail = props.last
+    ? (props.last.offers.length ? `${props.last.offers.length} result(s) on last search` : (props.last.note ?? props.last.error ?? 'No results on last search'))
+    : 'Not queried yet'
   return (
-    <div className="page-content utility-page">
-      <div className="utility-page-head">
-        <div>
-          <p className="eyebrow"><span className="eyebrow-spark"><BellRing size={12} /></span> Never overpay</p>
-          <h1>Price alerts</h1>
-          <p>PriceRadar is watching {alerts.filter((a) => a.status === 'active').length} products across connected stores.</p>
-        </div>
-        <button className="primary-button" onClick={onAdd}><Plus size={16} /> Track a product</button>
+    <div className="source-row">
+      <div className="source-row-head">
+        <strong>{props.name}</strong>
+        <StatusChip status={status} />
       </div>
+      <p>{props.note}</p>
+      <div className="source-row-foot">
+        <span>{detail}</span>
+        {props.docsUrl && (
+          <a href={props.docsUrl} target="_blank" rel="noreferrer noopener">API docs <ExternalLink size={11} /></a>
+        )}
+        <span className="source-kind">{props.kind === 'reference' ? 'Reference data' : 'Listings'}</span>
+      </div>
+    </div>
+  )
+}
 
-      {alerts.length === 0 ? (
-        <EmptyState
-          icon={<BellRing size={28} />}
-          title="No price alerts yet"
-          description="Search for a product and tap 'Set alert' to start tracking its price."
-          action={<button className="primary-button" onClick={onAdd}><Plus size={15} /> Track a product</button>}
-        />
-      ) : (
-        <section className="alerts-table-card">
-          <div className="utility-card-head">
-            <span className="card-label">ACTIVE WATCHLIST</span>
-            <h2>Products you're watching</h2>
-          </div>
-          {alerts.map((alert) => {
-            const product = catalog.find((p) => p.id === alert.productId)
-            const pct = Math.round(((alert.currentBest - alert.targetPrice) / alert.targetPrice) * 100)
-            const reached = alert.currentBest <= alert.targetPrice
-            return (
-              <div key={alert.id} className="alert-row">
-                <div className="alert-product-art">
-                  {product && <ProductArt kind={product.imageKind} size="sm" />}
-                </div>
-                <div className="alert-product">
-                  <strong>{alert.productName}</strong>
-                  <span>Set {fmtDate(alert.createdAt)}</span>
-                </div>
-                <div className="alert-target">
-                  <span>Target</span>
-                  <strong>{formatRupees(alert.targetPrice)}</strong>
-                </div>
-                <div className="alert-current">
-                  <span>Best now</span>
-                  <strong>{formatRupees(alert.currentBest)}</strong>
-                </div>
-                <div className={`alert-progress-copy${reached ? ' reached' : ''}`}>
-                  {reached ? <Check size={14} /> : <Clock3 size={14} />}
-                  {reached ? 'Target reached!' : `₹${(alert.currentBest - alert.targetPrice).toLocaleString('en-IN')} to go`}
-                </div>
-                <div className="alert-row-actions">
-                  <button className="secondary-button" onClick={() => onCompare(alert.productId)}>Compare</button>
-                  <button className="icon-button danger" onClick={() => onDelete(alert.id)} aria-label="Delete alert"><X size={15} /></button>
-                </div>
-              </div>
-            )
-          })}
-        </section>
+function ConfigurableSource({ adapterId, name, note, docsUrl, last, onToast }: {
+  adapterId: string
+  name: string
+  note: string
+  docsUrl?: string
+  last?: ProviderResult
+  onToast: (msg: string, type?: 'success' | 'info' | 'error') => void
+}) {
+  const spec = CREDENTIAL_SPECS[adapterId]
+  const [values, setValues] = useState<Record<string, string>>(() => providerConfig.get(adapterId))
+  const configured = providerConfig.isConfigured(adapterId)
+  return (
+    <div className="source-row configurable">
+      <div className="source-row-head">
+        <strong>{name}</strong>
+        <StatusChip status={last?.status ?? (configured ? 'connected' : 'auth_required')} />
+      </div>
+      <p>{note}</p>
+      <form
+        className="config-form"
+        onSubmit={(e) => {
+          e.preventDefault()
+          providerConfig.set(adapterId, values)
+          onToast(`${name} credentials saved on this device — run a search to query it`, 'success')
+        }}
+      >
+        {spec.fields.map((f) => (
+          <input
+            key={f.key}
+            type="password"
+            value={values[f.key] ?? ''}
+            onChange={(e) => setValues((v) => ({ ...v, [f.key]: e.target.value }))}
+            placeholder={f.label}
+            aria-label={f.label}
+            title={f.hint}
+            autoComplete="off"
+          />
+        ))}
+        <button type="submit" className="primary-button"><KeyRound size={13} /> Save</button>
+        {configured && (
+          <button
+            type="button"
+            className="secondary-button"
+            onClick={() => {
+              providerConfig.clear(adapterId)
+              setValues({})
+              onToast(`${name} credentials removed`, 'info')
+            }}
+          >
+            Remove
+          </button>
+        )}
+      </form>
+      {last && last.offers.length === 0 && last.error && <p className="source-row-error">{last.error}</p>}
+      {docsUrl && (
+        <div className="source-row-foot">
+          <span />
+          <a href={docsUrl} target="_blank" rel="noreferrer noopener">API docs <ExternalLink size={11} /></a>
+        </div>
       )}
     </div>
   )
 }
 
-// ─── Wishlist View ────────────────────────────────────────────────────────────
+// ─── Alerts / Wishlist / History ──────────────────────────────────────────────
 
-function WishlistView({
-  wishlist, catalog, onProduct, onRemove,
-}: { wishlist: WishlistItem[]; catalog: Product[]; onProduct: (p: Product) => void; onRemove: (id: string) => void }) {
-  const items = wishlist.map((w) => catalog.find((c) => c.id === w.productId)).filter(Boolean) as Product[]
-
+function AlertsView({ alerts, onDelete, onGoCompare }: {
+  alerts: PriceAlert[]
+  onDelete: (id: string) => void
+  onGoCompare: () => void
+}) {
   return (
-    <div className="page-content utility-page">
+    <div className="page-content">
       <div className="utility-page-head">
         <div>
-          <p className="eyebrow"><span className="eyebrow-spark"><Heart size={12} /></span> Your saved buys</p>
-          <h1>Wishlist</h1>
-          <p>Track products you're considering. PriceRadar watches their prices.</p>
+          <p className="section-kicker"><BellRing size={12} /> Price alerts</p>
+          <h2>Your alerts</h2>
         </div>
       </div>
-
-      {items.length === 0 ? (
+      {alerts.length === 0 ? (
         <EmptyState
-          icon={<Heart size={28} />}
-          title="Your wishlist is empty"
-          description="Search for a product and tap the heart icon to save it here."
+          icon={<Bell size={22} />}
+          title="No alerts yet"
+          body="Set an alert from a verified product card. Alerts reference real products only and compare against prices PriceRadar actually retrieves."
+          actions={<button className="primary-button" onClick={onGoCompare}><Search size={14} /> Compare a product</button>}
+        />
+      ) : (
+        <div className="alerts-table-card">
+          {alerts.map((a) => (
+            <div key={a.id} className="alert-row">
+              <div className="alert-product-info">
+                <strong>{a.productName}</strong>
+                <span>
+                  Alert below {formatMoney(a.targetPrice, a.currency)}
+                  {a.currentBest !== null
+                    ? ` · last verified best ${formatMoney(a.currentBest, a.currency)}${a.currentBestSource ? ` (${a.currentBestSource})` : ''}`
+                    : ' · no verified price recorded yet'}
+                </span>
+              </div>
+              <button className="icon-button" aria-label="Delete alert" onClick={() => onDelete(a.id)}>
+                <X size={15} />
+              </button>
+            </div>
+          ))}
+        </div>
+      )}
+    </div>
+  )
+}
+
+function WishlistView({ wishlist, onSearch, onRemove }: {
+  wishlist: WishlistItem[]
+  onSearch: (q: string) => void
+  onRemove: (key: string) => void
+}) {
+  return (
+    <div className="page-content">
+      <div className="utility-page-head">
+        <div>
+          <p className="section-kicker"><Heart size={12} /> Wishlist</p>
+          <h2>Saved products</h2>
+        </div>
+      </div>
+      {wishlist.length === 0 ? (
+        <EmptyState
+          icon={<Heart size={22} />}
+          title="Nothing saved yet"
+          body="Search a real product and save it from its identity card. Wishlists contain only products verified through a real identity source."
         />
       ) : (
         <div className="wishlist-grid">
-          {items.map((item) => {
-            const best = Math.min(...item.offers.map((o) => finalPrice(o) ?? Infinity))
-            const prov = item.offers.find((o) => finalPrice(o) === best)?.provider
-            return (
-              <div key={item.id} className="wishlist-card">
-                <button className="wishlist-remove" onClick={() => onRemove(item.id)} aria-label="Remove from wishlist">
+          {wishlist.map((w) => (
+            <div key={productKeyOf(w.identity)} className="wishlist-card">
+              {w.identity.imageUrl && <img className="wishlist-art" src={w.identity.imageUrl} alt="" loading="lazy" />}
+              <div className="wishlist-copy">
+                <strong>{w.identity.name}</strong>
+                <span>{[w.identity.brand, w.identity.quantity].filter(Boolean).join(' · ') || w.identity.barcode}</span>
+                <span className="wishlist-provider">Identity: {w.identity.sourceName}</span>
+              </div>
+              <div className="wishlist-actions">
+                <button className="secondary-button" onClick={() => onSearch(w.identity.barcode ?? w.identity.name)}>
+                  Compare
+                </button>
+                <button className="icon-button" aria-label="Remove" onClick={() => onRemove(productKeyOf(w.identity))}>
                   <X size={14} />
                 </button>
-                <button className="wishlist-inner" onClick={() => onProduct(item)}>
-                  <div className="wishlist-art"><ProductArt kind={item.imageKind} size="md" /></div>
-                  <div className="wishlist-copy">
-                    <span className="wishlist-category">{item.category}</span>
-                    <h3>{item.name}</h3>
-                    <p>{item.variant} · {item.quantity}</p>
-                    <strong>{formatRupees(isFinite(best) ? best : null)}</strong>
-                    {prov && <span className="wishlist-provider" style={{ color: prov.color, background: prov.background }}>{prov.name}</span>}
-                    <small>best total across {item.offers.length} offers <ArrowUpRight size={12} /></small>
-                  </div>
-                </button>
-                <button className="primary-button wishlist-compare" onClick={() => onProduct(item)}>
-                  Compare prices
-                </button>
               </div>
-            )
-          })}
+            </div>
+          ))}
         </div>
       )}
     </div>
   )
 }
 
-// ─── History View ─────────────────────────────────────────────────────────────
-
-function HistoryView({
-  history, catalog, onSearch, onClear,
-}: { history: SearchHistoryEntry[]; catalog: Product[]; onSearch: (q: string) => void; onClear: () => void }) {
+function HistoryView({ history, onSearch, onClear }: {
+  history: SearchHistoryEntry[]
+  onSearch: (q: string) => void
+  onClear: () => void
+}) {
   return (
-    <div className="page-content utility-page">
+    <div className="page-content">
       <div className="utility-page-head">
         <div>
-          <p className="eyebrow"><span className="eyebrow-spark"><History size={12} /></span> Pick up where you left off</p>
-          <h1>Search history</h1>
-          <p>Your recent comparisons, kept in one place.</p>
+          <p className="section-kicker"><History size={12} /> Search history</p>
+          <h2>Your searches</h2>
         </div>
-        <button className="secondary-button" onClick={onClear}><X size={14} /> Clear history</button>
+        {history.length > 0 && (
+          <button className="secondary-button" onClick={onClear}>Clear history</button>
+        )}
       </div>
-
       {history.length === 0 ? (
         <EmptyState
-          icon={<History size={28} />}
-          title="No search history yet"
-          description="Once you search for products, your comparisons will appear here."
+          icon={<History size={22} />}
+          title="No searches yet"
+          body="Your real searches and their verified result counts will appear here."
         />
       ) : (
-        <section className="history-list-card">
-          {history.map((item, i) => {
-            const product = catalog.find((c) => c.id === item.productId)
-            return (
-              <button key={`${item.query}-${i}`} className="history-row" onClick={() => onSearch(item.query)}>
-                <div className="history-number">
-                  {String(i + 1).padStart(2, '0')}
-                </div>
-                {product && (
-                  <div className="history-thumb"><ProductArt kind={product.imageKind} size="sm" /></div>
-                )}
-                <div className="history-query">
-                  <strong>{item.query}</strong>
-                  <span>{item.offerCount} offers · {fmtRelTime(item.timestamp)}</span>
-                </div>
-                {item.bestTotal !== undefined && (
-                  <div className="history-best">
-                    <span>Best total</span>
-                    <strong>{formatRupees(item.bestTotal)}</strong>
-                  </div>
-                )}
-                <ArrowRight size={17} />
+        <div className="history-list-card">
+          {history.map((h, i) => (
+            <div key={`${h.query}-${i}`} className="history-row">
+              <button className="history-query" onClick={() => onSearch(h.query)}>
+                <Search size={13} /> {h.query}
               </button>
-            )
-          })}
-        </section>
+              <span className="history-meta">
+                {h.identityName ? `${h.identityName} · ` : ''}{h.offerCount} verified offer(s)
+              </span>
+              <span className="history-meta">{new Date(h.timestamp).toLocaleString('en-IN')}</span>
+            </div>
+          ))}
+        </div>
       )}
     </div>
   )
 }
 
-// ─── Offer Modal ──────────────────────────────────────────────────────────────
+// ─── Empty state ──────────────────────────────────────────────────────────────
 
-function OfferModal({ offer, onClose }: { offer: Offer; onClose: () => void }) {
-  const feeRows = buildFeeRows(offer)
-  const fp = finalPrice(offer)
-  const disc = discountPercent(offer)
-
-  useEffect(() => {
-    const handler = (e: globalThis.KeyboardEvent) => { if (e.key === 'Escape') onClose() }
-    document.addEventListener('keydown', handler)
-    return () => document.removeEventListener('keydown', handler)
-  }, [onClose])
-
-  return (
-    <div className="modal-backdrop" onMouseDown={onClose} role="dialog" aria-modal="true" aria-label="Offer details">
-      <section className="offer-modal" onMouseDown={(e) => e.stopPropagation()}>
-        <button className="modal-close" onClick={onClose} aria-label="Close"><X size={18} /></button>
-
-        <div className="modal-provider-bar" style={{ background: offer.provider.background }}>
-          <span className="modal-provider-mark" style={{ color: offer.provider.color }}>{offer.provider.mark}</span>
-          <span className="modal-provider-name" style={{ color: offer.provider.color }}>{offer.provider.name}</span>
-          <MatchBadge match={offer.match} />
-        </div>
-
-        <div className="modal-body">
-          <div className="modal-product">
-            <div className="modal-product-info">
-              <strong>{offer.productName}</strong>
-              <span>{offer.variant} · {offer.quantity}</span>
-              <div className="modal-meta-row">
-                <MatchBadge match={offer.match} />
-                <span className="modal-freshness">
-                  {offer.freshness === 'live'
-                    ? <><span className="tiny-live-dot" aria-hidden="true" /> Live source</>
-                    : <>Updated {offer.updatedSeconds}s ago</>
-                  }
-                </span>
-              </div>
-            </div>
-          </div>
-
-          {/* Transparent breakdown */}
-          <div className="breakdown-box">
-            <div className="breakdown-head">
-              <span>Transparent total</span>
-              <span>{offer.etaLabel} delivery</span>
-            </div>
-            {feeRows.map(([label, value]) => (
-              <div className="breakdown-row" key={label}>
-                <span>
-                  {label}
-                  {label === 'Product price' && offer.mrp > offer.price && (
-                    <small> MRP {formatRupees(offer.mrp)}</small>
-                  )}
-                </span>
-                <strong>
-                  {value === null ? <em>At checkout</em> : (
-                    <span style={{ color: typeof value === 'number' && value < 0 ? '#65b88c' : undefined }}>
-                      {typeof value === 'number' && value < 0 ? `-${formatRupees(-value)}` : formatRupees(value as number)}
-                    </span>
-                  )}
-                </strong>
-              </div>
-            ))}
-            <div className="breakdown-total">
-              <span>Final payable price</span>
-              <strong>{formatRupees(fp)}</strong>
-            </div>
-            {fp === null && (
-              <p className="checkout-warning"><AlertCircle size={12} /> Final amount not known until checkout</p>
-            )}
-          </div>
-
-          {offer.fees.note && (
-            <p className="fee-note"><Info size={13} /> {offer.fees.note}</p>
-          )}
-
-          {/* Seller & facts */}
-          <div className="modal-facts">
-            <div><span>Sold by</span><strong>{offer.seller}</strong></div>
-            <div>
-              <span>Availability</span>
-              <strong className={`avail-${offer.availability}`}>
-                {offer.availability === 'in_stock'   ? '● In stock'    : ''}
-                {offer.availability === 'low_stock'  ? '● Low stock'   : ''}
-                {offer.availability === 'unavailable' ? '● Unavailable' : ''}
-              </strong>
-            </div>
-            {offer.returnPolicy && <div><span>Return policy</span><strong>{offer.returnPolicy}</strong></div>}
-            {offer.warranty     && <div><span>Warranty</span><strong>{offer.warranty}</strong></div>}
-            <div>
-              <span>Match confidence</span>
-              <strong>{Math.round(offer.matchScore * 100)}%</strong>
-            </div>
-            <div><span>Match reason</span><strong>{offer.matchReason}</strong></div>
-          </div>
-
-          {offer.rating && (
-            <div className="modal-rating">
-              <Star size={14} fill="currentColor" style={{ color: '#f4cb63' }} />
-              <strong>{offer.rating}</strong>
-              {offer.reviewCount && <span>({offer.reviewCount} reviews)</span>}
-            </div>
-          )}
-
-          <div className="modal-actions">
-            <a className="primary-modal-button" href={offer.url} target="_blank" rel="noreferrer">
-              View on {offer.provider.name} <ExternalLink size={15} />
-            </a>
-            <button className="secondary-modal-button" onClick={onClose}>Keep comparing</button>
-          </div>
-
-          <p className="modal-disclaimer">
-            <ShieldCheck size={12} /> Price and availability can change at checkout. Last checked {offer.updatedSeconds}s ago.
-          </p>
-        </div>
-      </section>
-    </div>
-  )
-}
-
-// ─── Alert Modal ──────────────────────────────────────────────────────────────
-
-function AlertModal({
-  product, price, setPrice, existingAlert, onClose, onSave,
-}: {
-  product: Product; price: string; setPrice: (v: string) => void
-  existingAlert?: PriceAlert; onClose: () => void; onSave: () => void
+function EmptyState({ icon, title, body, actions }: {
+  icon: ReactNode
+  title: string
+  body: ReactNode
+  actions?: ReactNode
 }) {
-  const best = Math.min(...product.offers.map((o) => finalPrice(o) ?? Infinity))
-
-  useEffect(() => {
-    const handler = (e: globalThis.KeyboardEvent) => { if (e.key === 'Escape') onClose() }
-    document.addEventListener('keydown', handler)
-    return () => document.removeEventListener('keydown', handler)
-  }, [onClose])
-
   return (
-    <div className="modal-backdrop" onMouseDown={onClose} role="dialog" aria-modal="true" aria-label="Set a price alert">
-      <section className="alert-modal" onMouseDown={(e) => e.stopPropagation()}>
-        <button className="modal-close" onClick={onClose} aria-label="Close"><X size={18} /></button>
-        <div className="alert-modal-icon"><BellRing size={20} /></div>
-        <p className="modal-kicker">PRICE ALERT</p>
-        <h2>Let the radar watch it.</h2>
-        <p className="alert-intro">
-          We'll check connected sources and notify you when{' '}
-          <strong>{product.name}</strong> drops below your target price.
-        </p>
-
-        <label className="target-price-label" htmlFor="alert-price-input">
-          Alert me below
-          <span>
-            <span aria-hidden="true">₹</span>
-            <input
-              id="alert-price-input"
-              value={price}
-              onChange={(e) => setPrice(e.target.value.replace(/[^0-9]/g, ''))}
-              inputMode="numeric"
-              aria-label="Target price in rupees"
-              autoFocus
-            />
-          </span>
-        </label>
-
-        <div className="alert-current">
-          <span>Best available now</span>
-          <strong>{formatRupees(isFinite(best) ? best : null)}</strong>
-        </div>
-
-        <button className="save-alert-button" onClick={onSave}>
-          <BellRing size={16} />
-          {existingAlert ? 'Update alert' : 'Save price alert'}
-        </button>
-
-        <p className="alert-fineprint">
-          <ShieldCheck size={12} /> Manage alerts anytime from the Price alerts view.
-        </p>
-      </section>
+    <div className="empty-state main-empty">
+      <div className="empty-icon">{icon}</div>
+      <h3>{title}</h3>
+      <p>{body}</p>
+      {actions && <div className="empty-actions">{actions}</div>}
     </div>
   )
 }
 
-// ─── AI Panel ─────────────────────────────────────────────────────────────────
+// ─── AI panel ─────────────────────────────────────────────────────────────────
 
-function AiPanel({
-  messages, draft, setDraft, loading, endRef, onClose, onSubmit, onPrompt,
-}: {
+function AiPanel(props: {
   messages: AiMessage[]
-  draft: string; setDraft: (v: string) => void
-  loading: boolean
+  draft: string
+  setDraft: (v: string) => void
+  thinking: boolean
   endRef: React.RefObject<HTMLDivElement>
   onClose: () => void
   onSubmit: (e: FormEvent<HTMLFormElement>) => void
-  onPrompt: (p: string) => void
+  hasSearch: boolean
 }) {
-  useEffect(() => {
-    const handler = (e: globalThis.KeyboardEvent) => { if (e.key === 'Escape') onClose() }
-    document.addEventListener('keydown', handler)
-    return () => document.removeEventListener('keydown', handler)
-  }, [onClose])
-
   return (
-    <div className="ai-panel-backdrop" onMouseDown={onClose} role="dialog" aria-modal="true" aria-label="AI shopping assistant">
-      <section className="ai-panel" onMouseDown={(e) => e.stopPropagation()}>
+    <div className="ai-panel-backdrop" onMouseDown={(e) => { if (e.target === e.currentTarget) props.onClose() }} role="dialog" aria-modal="true" aria-label="AI shopping assistant">
+      <div className="ai-panel">
         <div className="ai-panel-header">
+          <span className="ai-icon"><Sparkles size={15} /></span>
           <div className="ai-panel-title">
-            <span className="ai-icon large"><Sparkles size={17} /></span>
-            <div>
-              <strong>PriceRadar AI</strong>
-              <span>Grounded in real price data</span>
-            </div>
+            <strong>PriceRadar Assistant</strong>
+            <span>Grounded in retrieved data only</span>
           </div>
-          <button className="modal-close" onClick={onClose} aria-label="Close AI panel"><X size={18} /></button>
+          <button className="modal-close" onClick={props.onClose} aria-label="Close AI panel"><X size={18} /></button>
         </div>
 
         <div className="ai-chat">
-          {messages.length === 0 && (
+          {props.messages.length === 0 && (
             <div className="ai-message assistant">
-              <span className="message-avatar"><Radar size={14} /></span>
-              <div>
+              <div className="message-avatar"><Radar size={14} /></div>
+              <div className="message-bubble">
                 <p>
-                  Tell me what you want to buy, your budget, or how fast you need it.
-                  I'll compare real totals — not just sticker prices. I only use data from connected sources.
+                  I only discuss prices and offers PriceRadar actually retrieved from connected sources.
+                  I can’t and won’t invent prices, availability, delivery times, or discounts.
                 </p>
-                <span className="message-time">Just now</span>
+                {!props.hasSearch && <p>Run a product search first — then ask me about cheapest options, delivery, or price history.</p>}
               </div>
             </div>
           )}
-
-          {messages.map((msg) => (
-            <div key={msg.id} className={`ai-message ${msg.role}`}>
-              <span className="message-avatar">
-                {msg.role === 'assistant' ? <Radar size={14} /> : '👤'}
-              </span>
-              <div>
-                <p className="ai-message-text">{formatAiContent(msg.content)}</p>
-                <span className="message-time">{fmtRelTime(new Date(msg.timestamp).toISOString())}</span>
-                {msg.linkedProduct && (
-                  <div className="ai-linked-product">
-                    <ProductArt kind={msg.linkedProduct.imageKind} size="sm" />
-                    <span>{msg.linkedProduct.name}</span>
+          {props.messages.map((m) => (
+            <div key={m.id} className={`ai-message ${m.role}`}>
+              <div className="message-avatar">{m.role === 'assistant' ? <Radar size={14} /> : '👤'}</div>
+              <div className="message-bubble">
+                {m.content.split('\n').map((line, i) => (
+                  <p key={i} className={line.startsWith('**') ? 'ai-strong' : undefined}>
+                    {renderLine(line)}
+                  </p>
+                ))}
+                {m.citations && m.citations.length > 0 && (
+                  <div className="ai-citations">
+                    <span className="ai-citations-label">Data basis</span>
+                    {m.citations.map((c, i) => (
+                      <span key={i} className="ai-citation">
+                        {c.sourceName}{c.merchant && c.merchant !== c.sourceName ? ` · ${c.merchant}` : ''} · {formatMoney(c.price, c.currency)} · checked {Math.max(1, Math.round((Date.now() - c.retrievedAt) / 60000))} min ago
+                        {c.productUrl && <a href={c.productUrl} target="_blank" rel="noreferrer noopener" aria-label="Open cited listing"><ExternalLink size={10} /></a>}
+                      </span>
+                    ))}
                   </div>
                 )}
               </div>
             </div>
           ))}
-
-          {loading && (
-            <div className="ai-message assistant">
-              <span className="message-avatar"><Radar size={14} /></span>
-              <div className="ai-loading">
-                <span /><span /><span />
-              </div>
-            </div>
+          {props.thinking && (
+            <div className="ai-loading">Reading retrieved records…</div>
           )}
-
-          {messages.length === 0 && (
-            <div className="prompt-chips">
-              {AI_QUICK_PROMPTS.map((p) => (
-                <button key={p} onClick={() => onPrompt(p)}>
-                  {p} <ArrowUpRight size={13} />
-                </button>
-              ))}
-            </div>
-          )}
-
-          <div ref={endRef} />
+          <div ref={props.endRef} />
         </div>
 
-        <form className="ai-input-wrap" onSubmit={onSubmit}>
+        <div className="prompt-chips" aria-label="Suggested prompts">
+          {AI_QUICK_PROMPTS.map((pr) => (
+            <button key={pr} onClick={() => props.setDraft(pr)}>{pr}</button>
+          ))}
+        </div>
+
+        <form className="ai-input-wrap" onSubmit={props.onSubmit}>
           <input
-            autoFocus
-            value={draft}
-            onChange={(e) => setDraft(e.target.value)}
-            placeholder="Ask anything about a product…"
-            aria-label="Ask the AI assistant"
-            disabled={loading}
+            value={props.draft}
+            onChange={(e) => props.setDraft(e.target.value)}
+            placeholder={props.hasSearch ? 'Ask about the retrieved offers…' : 'Run a search first, then ask me…'}
+            aria-label="Ask the assistant"
           />
-          <button type="submit" aria-label="Send" disabled={loading || !draft.trim()}>
-            <ArrowUpRight size={17} />
-          </button>
+          <button type="submit" className="primary-button" disabled={props.thinking}>Ask</button>
         </form>
 
         <p className="ai-disclaimer">
-          <ShieldCheck size={12} /> All recommendations use real connected offer data.
-          No prices are estimated or invented.
+          Deterministic assistant: every figure is copied or computed from cited retrieval records. No generative shopping data.
         </p>
-      </section>
+      </div>
     </div>
   )
 }
 
-/** Basic markdown-lite formatter for AI messages */
-function formatAiContent(text: string): ReactNode {
-  return text.split('\n').map((line, i) => {
-    const parts = line.split(/(\*\*[^*]+\*\*)/)
-    return (
-      <span key={i}>
-        {parts.map((part, j) =>
-          part.startsWith('**') && part.endsWith('**')
-            ? <strong key={j}>{part.slice(2, -2)}</strong>
-            : part
-        )}
-        {i < text.split('\n').length - 1 && <br />}
-      </span>
-    )
-  })
-}
-
-// ─── Empty State ──────────────────────────────────────────────────────────────
-
-function EmptyState({
-  icon, title, description, action,
-}: { icon: ReactNode; title: string; description: string; action?: ReactNode }) {
-  return (
-    <div className="empty-state">
-      <div className="empty-icon">{icon}</div>
-      <h3>{title}</h3>
-      <p>{description}</p>
-      {action}
-    </div>
+/** Minimal inline formatter for the assistant’s plain-text replies. */
+function renderLine(line: string): ReactNode {
+  const parts = line.split(/(\*\*[^*]+\*\*)/g)
+  return parts.map((part, i) =>
+    part.startsWith('**') && part.endsWith('**')
+      ? <strong key={i}>{part.slice(2, -2)}</strong>
+      : <span key={i}>{part}</span>,
   )
 }
-
-
