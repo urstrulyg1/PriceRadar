@@ -368,7 +368,7 @@ function App() {
 
                   <section className="price-history-card">
                     <div className="card-section-heading"><div><span className="card-label">PRICE HISTORY</span><h3>Is now a good time?</h3></div><button className="more-button" onClick={() => setToast('Detailed price history is coming soon')}><MoreHorizontal size={17} /></button></div>
-                    <div className="history-price"><strong>{formatRupees(product.priceHistory.average)}</strong><span>average</span><em><ArrowDownRight size={13} /> {Math.abs(product.priceHistory.change)}%</em></div>
+                    <div className="history-price"><strong>{formatRupees(product.priceHistory.average)}</strong><span>average</span><em><ArrowDownRight size={13} /> {priceChangePercent(product)}% this period</em></div>
                     <div className="history-chart"><Sparkline points={product.priceHistory.points} /></div>
                     <p className="history-note"><span className="small-trend-icon"><TrendingDown size={12} /></span> Current price is <strong>attractive</strong> versus the {product.priceHistory.period} average.</p>
                     <button className="outline-full-button" onClick={() => setAlertOpen(true)}><BellRing size={14} /> Alert me below {formatRupees(product.priceHistory.lowest + 1)}</button>
@@ -450,6 +450,10 @@ function savingsAgainstHighest(offers: Offer[]): string {
   const totals = offers.filter((offer) => offer.match === 'exact').map((offer) => finalPrice(offer)).filter((total): total is number => total !== null)
   if (totals.length < 2) return '—'
   return formatRupees(Math.max(...totals) - Math.min(...totals))
+}
+
+function priceChangePercent(product: Product): number {
+  return Math.round((Math.abs(product.priceHistory.change) / product.priceHistory.average) * 100)
 }
 
 function OfferDetailsModal({ offer, onClose }: { offer: Offer; onClose: () => void }) {
